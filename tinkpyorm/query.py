@@ -641,7 +641,7 @@ class Query:
         key, expire = cache
         if key is True or key is None:
             sql, params = self._execute_select()
-            key = f"thinkorm:{sql}:{params}"
+            key = f"tinkpyorm:{sql}:{params}"
         return key, expire or 60
 
     def _build_result(self, rows: List[dict], sql: bool = True) -> Any:

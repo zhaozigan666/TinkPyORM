@@ -10,7 +10,7 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from thinkorm import Db, Model, Collection, raw, DataNotFound, QueryError
+from tinkpyorm import Db, Model, Collection, raw, DataNotFound, QueryError
 
 tmp = tempfile.mkdtemp()
 DB = os.path.join(tmp, "app.db")

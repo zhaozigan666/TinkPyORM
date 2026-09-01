@@ -1,4 +1,4 @@
-# thinkorm-py
+# TinkPyORM
 
 <div align="center">
 
@@ -53,7 +53,7 @@
 
 ## 简介
 
-`thinkorm-py` 把 **ThinkPHP think-orm v4.0** 那套优雅的链式查询 API 搬到 Python 上来，用 SQLite 作为存储后端。
+`TinkPyORM` 把 **ThinkPHP think-orm v4.0** 那套优雅的链式查询 API 搬到 Python 上来，用 SQLite 作为存储后端。
 
 如果你写过 ThinkPHP，下面这段代码会让你感到熟悉：
 
@@ -61,7 +61,7 @@
 # ThinkPHP 写法
 Db::name('user')->where('status', 1)->where('age', '>', 18)->order('id', 'desc')->select();
 
-# thinkorm-py 写法
+# TinkPyORM 写法
 Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').select()
 ```
 
@@ -109,18 +109,18 @@ Python 3.8+ 标准库：sqlite3, json, datetime, contextlib, collections, re, ty
 
 ## 安装
 
-无需安装，直接把 `thinkorm` 目录复制到你的项目里即可：
+无需安装，直接把 `tinkpyorm` 目录复制到你的项目里即可：
 
 ```bash
-git clone <your-repo-url> thinkorm-py
-cp -r thinkorm-py/thinkorm /path/to/your/project/
+git clone <your-repo-url> TinkPyORM
+cp -r TinkPyORM/tinkpyorm /path/to/your/project/
 ```
 
 或在本目录直接使用：
 
 ```python
-import sys; sys.path.insert(0, "/path/to/thinkorm-py")
-from thinkorm import Db, Model
+import sys; sys.path.insert(0, "/path/to/TinkPyORM")
+from tinkpyorm import Db, Model
 ```
 
 ---
@@ -128,7 +128,7 @@ from thinkorm import Db, Model
 ## 快速开始
 
 ```python
-from thinkorm import Db, Model, Collection
+from tinkpyorm import Db, Model, Collection
 
 # 1. 配置连接（SQLite 文件路径）
 Db.set_config({"database": "app.db"})
@@ -179,7 +179,7 @@ Db.set_config({
 Db.set_config("app.db")
 
 # ③ 传 Connection 对象（测试、多连接场景常用）
-from thinkorm import Connection
+from tinkpyorm import Connection
 Db.set_config(Connection(":memory:"))
 ```
 
@@ -387,7 +387,7 @@ Db.table("user").field("age").union_all(
 需要写数据库函数、算术运算而**不想被当作字符串值转义**时，用 `raw()` / `Raw`：
 
 ```python
-from thinkorm import raw, Raw
+from tinkpyorm import raw, Raw
 
 # WHERE 中的原生值
 Db.table("user").where("balance", ">", raw("50")).select()
@@ -485,7 +485,7 @@ except Exception:
 ### 定义模型
 
 ```python
-from thinkorm import Model
+from tinkpyorm import Model
 
 class User(Model):
     __table__ = "user"                  # 表名（默认：类名转 snake_case）
@@ -917,7 +917,7 @@ q.conn_render()      # 返回带真实参数值的 SQL 字符串（仅调试用�
 
 ## 与 think-orm 对照表
 
-| think-orm (PHP) | thinkorm-py | 备注 |
+| think-orm (PHP) | TinkPyORM | 备注 |
 |---|---|---|
 | `Db::name('user')` | `Db.name("user")` | 一致 |
 | `Db::table('user')` | `Db.table("user")` | 一致 |
@@ -952,7 +952,7 @@ q.conn_render()      # 返回带真实参数值的 SQL 字符串（仅调试用�
 
 ```bash
 # 单元测试（31 项，覆盖查询构造 / 写入 / 事务 / 模型 / 软删除 / 关联）
-python test_thinkorm.py
+python test_tinkpyorm.py
 
 # 冒烟测试（端到端，覆盖全链路 API）
 python smoke_test.py
@@ -975,8 +975,8 @@ README 示例：通过 112 项，失败 0 项
 ## 项目结构
 
 ```
-thinkorm-py/
-├── thinkorm/
+TinkPyORM/
+├── tinkpyorm/
 │   ├── __init__.py       # 包导出（版本、公开 API）
 │   ├── exceptions.py     # 异常体系（OrmError / DataNotFound / QueryError …）
 │   ├── utils.py          # Raw/raw、标识符转义、命名转换、字段解析
@@ -987,7 +987,7 @@ thinkorm-py/
 │   ├── relation.py       # 关联实现：4 种类型 + 批量预载入
 │   ├── model.py          # Model 基类 + MetaModel 元类（scope/camelCase/静态代理）
 │   └── db.py             # Db 门面：连接管理、入口、事务、日志
-├── test_thinkorm.py        # unittest 测试套件（31 项）
+├── test_tinkpyorm.py        # unittest 测试套件（31 项）
 ├── smoke_test.py           # 端到端冒烟测试
 ├── test_readme_examples.py # README 示例回归测试（112 项）
 └── README.md
@@ -1072,7 +1072,7 @@ thinkorm-py/
 
 ## 许可证
 
-**thinkorm-py** 采用 [MIT License](LICENSE) 发布 —— 你可以自由使用、复制、修改、合并、出版发行、散布、再授权及销售本软件。
+**TinkPyORM** 采用 [MIT License](LICENSE) 发布 —— 你可以自由使用、复制、修改、合并、出版发行、散布、再授权及销售本软件。
 
 参考设计来源 **think-orm** 采用 [Apache-2.0 License](https://github.com/top-think/think-orm/blob/master/LICENSE)，版权归 ThinkPHP 官方团队所有。本项目仅参考其**设计思想与 API 命名**，不包含其源代码，二者许可证相互独立。
 
@@ -1080,7 +1080,7 @@ thinkorm-py/
 
 <div align="center">
 
-**thinkorm-py** —— 用 Python 标准库，复刻 think-orm 的优雅
+**TinkPyORM** —— 用 Python 标准库，复刻 think-orm 的优雅
 
 *Inspired by [ThinkPHP](https://www.thinkphp.cn) · [think-orm](https://github.com/top-think/think-orm)*
 

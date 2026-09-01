@@ -1,4 +1,4 @@
-"""thinkorm 异常体系（参考 think-orm v4.0 的异常分层）。"""
+"""tinkpyorm 异常体系（参考 think-orm v4.0 的异常分层）。"""
 
 
 class OrmError(Exception):

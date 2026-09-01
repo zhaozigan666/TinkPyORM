@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
-"""thinkorm 完整测试套件（标准库 unittest）。"""
+"""tinkpyorm 完整测试套件（标准库 unittest）。"""
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from thinkorm import (
+from tinkpyorm import (
     Db, Model, Collection, Paginator, Raw, raw,
     DataNotFound, QueryError, RelationNotFound,
 )
-from thinkorm.connection import Connection
+from tinkpyorm.connection import Connection
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_test.db")
 if os.path.exists(DB_PATH):

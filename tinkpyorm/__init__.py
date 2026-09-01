@@ -1,4 +1,4 @@
-"""thinkorm —— 参考 think-orm v4.0 设计、基于 Python 标准库的 SQLite ORM。
+"""tinkpyorm —— 参考 think-orm v4.0 设计、基于 Python 标准库的 SQLite ORM。
 
 设计对齐（对应 think-orm 概念）:
     Db / Connection          -> 连接管理、事务

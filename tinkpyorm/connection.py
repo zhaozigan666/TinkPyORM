@@ -125,7 +125,7 @@ class Connection:
         """
         if self._in_transaction:
             self._savepoint_depth += 1
-            sp = f"thinkorm_sp_{self._savepoint_depth}"
+            sp = f"tinkpyorm_sp_{self._savepoint_depth}"
             self.conn.execute(f"SAVEPOINT {sp}")
             try:
                 yield self
