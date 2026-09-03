@@ -16,6 +16,9 @@ from .utils import Raw, raw, quote_ident, to_snake
 
 CacheValue = Tuple[float, Any]
 
+# SQLite 单语句绑定变量上限（SQLITE_MAX_VARIABLE_NUMBER）
+MAX_SQL_VARIABLES = 32766
+
 
 class Query:
     """链式查询构造器。"""
@@ -424,6 +427,12 @@ class Query:
                     return self.model._from_data({})
                 return {}
             return None
+        # 快路径：纯表查询（无模型绑定、无 json/attr/filter/with 后处理），
+        # 直接返回首行，跳过 Collection 包装与结果二次拷贝。
+        # find() 不涉及结果缓存，rows[0] 为本次新建 dict，引用安全。
+        o = self.options
+        if self.model is None and not (o["json"] or o["attr"] or o["filter"] or o["with"]):
+            return rows[0]
         return self._build_result(rows, sql=False)[0]
 
     def find_or_empty(self, id: Optional[Any] = None) -> Any:
@@ -528,17 +537,53 @@ class Query:
             return conn_render(sql, params)
         return conn.insert(sql, params)
 
-    def insert_all(self, data_list: List[dict]) -> int:
-        """批量插入，返回插入行数。"""
+    def insert_all(self, data_list: List[dict], batch_size: Optional[int] = None) -> int:
+        """批量插入，返回插入行数。
+
+        行数较多时自动分批，规避 SQLite 单语句绑定变量上限
+        （SQLITE_MAX_VARIABLE_NUMBER = 32766）：单批上限为 ``32766 // 列数``。
+        分批在同一事务内完成以保证原子性；若调用方已处于事务中，
+        则退化为 SAVEPOINT 嵌套，语义不变。
+
+        ``batch_size`` 可显式指定每批行数（默认按列数自动计算）。
+        """
         if not data_list:
             return 0
         conn = self._resolve_conn()
-        sql, params = self.builder.insert_all(self.options, data_list)
-        self._last_sql, self._last_params = sql, params
+
+        fields = list(data_list[0].keys())
+        size = batch_size or max(1, MAX_SQL_VARIABLES // max(len(fields), 1))
+
+        # 单批可容纳：保持原有路径，零额外开销
+        if len(data_list) <= size:
+            sql, params = self.builder.insert_all(self.options, data_list)
+            self._last_sql, self._last_params = sql, params
+            if self.options["fetch_sql"]:
+                return conn_render(sql, params)
+            conn.execute(sql, params)
+            return len(data_list)
+
+        # 多批：先整体校验字段一致性，保证与单批一致的报错行为
+        expected = set(fields)
+        for row in data_list:
+            if set(row.keys()) != expected:
+                raise QueryError("insert_all 各行字段必须一致")
+
+        # fetch_sql 模式不执行，返回首条 SQL 供调试
         if self.options["fetch_sql"]:
+            sql, params = self.builder.insert_all(self.options, data_list[:size])
+            self._last_sql, self._last_params = sql, params
             return conn_render(sql, params)
-        conn.execute(sql, params)
-        return len(data_list)
+
+        total = 0
+        with conn.transaction():
+            for i in range(0, len(data_list), size):
+                chunk = data_list[i:i + size]
+                sql, params = self.builder.insert_all(self.options, chunk)
+                self._last_sql, self._last_params = sql, params
+                conn.execute(sql, params)
+                total += len(chunk)
+        return total
 
     def update(self, data: Optional[dict] = None) -> int:
         """更新数据，返回影响行数。必须存在 where 条件。"""

@@ -275,6 +275,51 @@ class TestWrite(unittest.TestCase):
         n = Db.table("user").insert_all([{"name": "a1"}, {"name": "a2"}, {"name": "a3"}])
         self.assertEqual(n, 3)
         self.assertEqual(Db.table("user").count(), 3)
+        Db.execute("DELETE FROM user")
+
+    def test_insert_all_auto_batch(self):
+        """超 SQLite 绑定变量上限（32766）时自动分批，并保持原子性。
+
+        每行 8 列 -> 单批上限 32766 // 8 = 4095 行，用 8000 行强制分批。
+        """
+        def bulk(i):
+            return {"name": f"bulk{i}", "email": f"b{i}@x.com", "age": i % 50,
+                    "status": i % 2, "balance": i * 1.5, "tags": "",
+                    "create_time": "2026-09-01", "update_time": "2026-09-01"}
+
+        n = Db.table("user").insert_all([bulk(i) for i in range(8000)])
+        self.assertEqual(n, 8000)
+        self.assertEqual(Db.table("user").count(), 8000)
+
+        # 原子性：任一行字段不一致 -> 整体回滚，不允许部分提交
+        bad = [bulk(i) for i in range(8000)]
+        bad[5000] = {"name": "broken", "age": 1}
+        with self.assertRaises(QueryError):
+            Db.table("user").insert_all(bad)
+        self.assertEqual(Db.table("user").count(), 8000)
+
+        # 显式指定批大小
+        n = Db.table("user").insert_all([bulk(i) for i in range(500)], batch_size=100)
+        self.assertEqual(n, 500)
+        self.assertEqual(Db.table("user").count(), 8500)
+        Db.execute("DELETE FROM user")
+
+    def test_sql_log_limit_and_switch(self):
+        """SQL 日志受上限约束，可整体开关（避免长驻进程内存无限增长）。"""
+        Db.sql_log_enable(50)
+        Db.sql_log_clear()
+        for _ in range(200):
+            Db.table("user").find(1)
+        self.assertEqual(len(Db.get_sql_log()), 50)
+
+        Db.sql_log_disable()
+        Db.table("user").find(1)
+        self.assertEqual(len(Db.get_sql_log()), 0)
+
+        Db.sql_log_enable()          # 恢复默认，避免影响其它用例
+        Db.table("user").find(1)
+        self.assertEqual(len(Db.get_sql_log()), 1)
+        Db.sql_log_clear()
 
 
 class TestTransaction(unittest.TestCase):

@@ -21,7 +21,7 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
     "Raw", "raw", "to_snake", "to_camel",

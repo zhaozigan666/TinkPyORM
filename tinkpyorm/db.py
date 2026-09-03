@@ -135,3 +135,14 @@ class Db:
     @classmethod
     def sql_log_clear(cls, name: Optional[str] = None) -> None:
         cls.get_connection(name).sql_log_clear()
+
+    @classmethod
+    def sql_log_disable(cls, name: Optional[str] = None) -> None:
+        """关闭 SQL 日志（生产环境推荐，避免长驻进程内存持续增长）。"""
+        cls.get_connection(name).sql_log_disable()
+
+    @classmethod
+    def sql_log_enable(cls, max_size: Optional[int] = 1000,
+                       name: Optional[str] = None) -> None:
+        """开启 SQL 日志，最多保留 ``max_size`` 条（None 表示不限制）。"""
+        cls.get_connection(name).sql_log_enable(max_size)

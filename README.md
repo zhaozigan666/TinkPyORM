@@ -40,6 +40,7 @@
 - [结果集与分页](#结果集与分页)
 - [camelCase 别名](#camelcase-别名)
 - [调试与 SQL 日志](#调试与-sql-日志)
+- [性能实践建议](#性能实践建议)
 - [API 速查表](#api-速查表)
 - [与 think-orm 对照表](#与-think-orm-对照表)
 - [运行测试](#运行测试)
@@ -173,6 +174,8 @@ Db.set_config({
     "database": "app.db",     # SQLite 文件路径（或 ":memory:"）
     "prefix":   "tp_",        # 表前缀（配合 Db.name() 自动拼接）
     "timeout":  5,            # 传给 sqlite3.connect 的额外关键字参数
+    # "journal_mode": "WAL",  # 连接建立后执行 PRAGMA journal_mode=WAL
+    #                         # （文件库写性能提升数十倍，见"性能实践建议"）
 })
 
 # ② 直接传路径
@@ -181,6 +184,14 @@ Db.set_config("app.db")
 # ③ 传 Connection 对象（测试、多连接场景常用）
 from tinkpyorm import Connection
 Db.set_config(Connection(":memory:"))
+```
+
+**journal_mode（WAL 等）**：可在字典配置中指定 `journal_mode`，连接建立后自动执行
+对应 PRAGMA（内存库自动跳过）：
+
+```python
+Db.set_config({"database": "app.db", "journal_mode": "WAL"})   # 推荐：读写并发 + 写性能大幅提升
+Db.set_config({"database": "app.db", "journal_mode": "OFF"})   # 其他合法值：delete/truncate/persist/memory/wal/off
 ```
 
 **多连接：**
@@ -413,6 +424,13 @@ uid = Db.table("user").insert({"name": "alice", "age": 20})
 n = Db.table("user").insert_all([
     {"name": "a"}, {"name": "b"}, {"name": "c"},
 ])
+
+# 大批量插入（自动分批，调用方无需关心）
+# SQLite 单语句绑定变量上限为 32766，超过会报 "too many SQL variables"。
+# insert_all 会按 32766 // 列数 自动分批（如 6 列表每批 5461 行），
+# 分批在同一事务内完成，中途失败整体回滚；也可显式指定批大小。
+n = Db.table("user").insert_all(big_list)              # 自动分批
+n = Db.table("user").insert_all(big_list, batch_size=500)  # 每批 500 行
 
 # 更新，返回影响行数（不带 where 会抛 QueryError，防止误全表更新）
 n = Db.table("user").where("id", uid).update({"age": 21})
@@ -870,6 +888,13 @@ Db.get_last_sql()
 Db.get_sql_log()
 Db.sql_log_clear()
 
+# 日志默认只保留最近 1000 条（环形裁剪），避免长驻进程内存无限增长。
+# 生产环境可整体关闭；需要完整日志时设为 None（不限制）。
+Db.sql_log_disable()          # 关闭并清空
+Db.sql_log_enable()           # 重新开启，上限 1000 条
+Db.sql_log_enable(max_size=5000)
+Db.set_config({"database": "app.db", "sql_log_max": None})  # 不限制
+
 # 查询分析
 Db.table("user").where("age", ">", 18).explain()
 ```
@@ -880,6 +905,64 @@ Db.table("user").where("age", ">", 18).explain()
 q = Db.table("user").where("id", 1)
 q.conn_render()      # 返回带真实参数值的 SQL 字符串（仅调试用，勿直接执行）
 ```
+
+---
+
+## 性能实践建议
+
+TinkPyORM 基于标准库 sqlite3，ORM 层的 Python 开销为**微秒量级**（主键点查约 20 µs）。
+实际性能差距几乎全部来自**使用策略**（事务与 PRAGMA），量级为毫秒——相差三个数量级。
+以下按收益排序：
+
+**① 循环内写操作务必包事务（收益数百倍）**
+
+SQLite 每次提交都伴随磁盘 fsync（本机约 8 ms/次）。ORM 默认逐条自动提交（与 think-orm
+对齐），因此在循环中写数据时，用 `Db.transaction()` 包裹可把耗时从毫秒级降到微秒级：
+
+```python
+# 慢：每条 insert 一次 fsync
+for u in users:
+    Db.table("user").insert(u)
+
+# 快：单事务，快 200–300 倍
+Db.transaction(lambda: [Db.table("user").insert(u) for u in users])
+# 或 with Db.transaction(): ...
+```
+
+**② 开启 WAL（连接配置一行，写入可提升数十倍）**
+
+```python
+Db.set_config({"database": "app.db", "journal_mode": "WAL"})
+```
+
+WAL 模式允许读与写并发，并把 `synchronous=NORMAL` 下的逐条提交成本从毫秒级降到百微秒级。
+桌面应用（如 FreeVault 类本地数据库）与长驻服务均推荐。注意 WAL 会产生额外的
+`-wal` / `-shm` 文件（数据库关闭/checkpoint 后合并回主库）。
+
+**③ 批量写入用 `insert_all`（自动分批）**
+
+```python
+Db.table("user").insert_all(big_list)            # 自动按 32766//列数 分批，单事务原子
+Db.table("user").insert_all(big_list, batch_size=500)
+# 配合外层事务仍可再提速：Db.transaction(lambda: Db.table("user").insert_all(big_list))
+```
+
+**④ 高频点查 / 海量结果按需选择 API**
+
+| 场景 | 推荐 | 原因 |
+|---|---|---|
+| 单行点查 | `Db.table().find(id)` 已足够 | 走快路径，ORM 开销约 20 µs |
+| 极端高频（>5000 QPS） | 热点改用 `Db.query(sql, params)` | 绕过 Query/Builder 层，再省约 15 µs |
+| 大结果集全量加载 | `column('name')` / `field(...)` 取必要列 | Model 实例内存约 4.9×，dict 约 2.1× |
+| 超大数据集 | `page()`/`paginate()` 分页 | 避免全量驻留 |
+
+**⑤ 生产环境关闭 SQL 日志**
+
+```python
+Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长驻进程请关闭或定期 clear
+```
+
+> 完整实测数据见仓库内 `PERFORMANCE.md`（15 个场景、与原生 sqlite3 三档对照、三轮中位数）。
 
 ---
 
@@ -897,7 +980,7 @@ q.conn_render()      # 返回带真实参数值的 SQL 字符串（仅调试用�
 | 分组排序 | `group` `having` `having_or` `order` `order_raw` |
 | 限制 | `limit` `page` `paginate` |
 | 查询 | `select` `select_or_fail` `find` `find_or_empty` `find_or_fail` `value` `column` `count` `sum` `avg` `max` `min` `paginate` `explain` |
-| 写入 | `insert` `insert_all` `update` `save` `delete` `inc` `dec` |
+| 写入 | `insert` `insert_all(list, batch_size=None)` `update` `save` `delete` `inc` `dec` |
 | 关联 | `with_` |
 | 其他 | `cache` `comment` `lock` `fetch_sql` `fail_exception` `allow_empty` `copy` `get_last_sql` |
 
@@ -911,7 +994,7 @@ q.conn_render()      # 返回带真实参数值的 SQL 字符串（仅调试用�
 
 ### Db（门面）
 
-`set_config` `get_connection` `close` `table` `name` `raw` `query` `execute` `transaction` `get_sql_log` `get_last_sql` `sql_log_clear`
+`set_config` `get_connection` `close` `table` `name` `raw` `query` `execute` `transaction` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
 
 ---
 
@@ -1012,6 +1095,22 @@ TinkPyORM/
 ---
 
 ## 更新记录
+
+### v0.2.0
+
+健壮性与性能（基于与原生 sqlite3 的 15 场景基准评估，详见 `PERFORMANCE.md`）：
+
+1. **`insert_all` 自动分批（修复严重缺陷）** —— 超过 SQLite 绑定变量上限（32766，6 列表约
+   5461 行）的批量插入此前会抛 `too many SQL variables` 崩溃；现按 `32766 // 列数` 自动分批，
+   并在同一事务内完成保证原子性（嵌套事务退化为 SAVEPOINT，语义不变）。可用
+   `batch_size` 显式控制每批行数。
+2. **SQL 日志加上限与开关（修复内存无限增长）** —— 默认仅保留最近 1000 条（环形裁剪），
+   新增 `sql_log_enable(max_size=...)` / `sql_log_disable()` 与配置项 `sql_log_max`
+   （`None` 表示不限制，兼容旧行为）。
+3. **`journal_mode` 连接配置** —— `Db.set_config({"database": ..., "journal_mode": "WAL"})`
+   在连接建立后自动执行对应 PRAGMA（内存库跳过），一行开启 WAL 等写优化。
+4. **`find()` 单行快路径** —— 纯表查询（无模型/无 json/attr/filter/with 后处理）直接返回
+   首行，跳过结果集包装与二次拷贝，主键点查 ORM 开销更低。
 
 ### v0.1.1
 

@@ -11,6 +11,13 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from .exceptions import TransactionError
 
+# SQL 日志默认保留条数上限（环形裁剪）。长驻进程若不限制，
+# 每条 SQL 约 220 字节，百万次操作将累积数百 MB 且永不释放。
+DEFAULT_SQL_LOG_MAX = 1000
+
+# 合法 journal_mode（对应 SQLite PRAGMA journal_mode）
+_JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
+
 
 class Connection:
     """SQLite 连接封装。
@@ -24,6 +31,19 @@ class Connection:
 
     def __init__(self, database: str = ":memory:", **kwargs: Any):
         self.database = database
+        # SQL 日志开关与上限；sql_log_max=None 表示不限制（旧行为）
+        self.sql_log_enabled: bool = bool(kwargs.pop("sql_log_enabled", True))
+        self.sql_log_max: Optional[int] = kwargs.pop(
+            "sql_log_max", DEFAULT_SQL_LOG_MAX)
+        # 连接建立后执行的 PRAGMA journal_mode（如 "WAL"）；None 表示不设置
+        self.journal_mode: Optional[str] = kwargs.pop("journal_mode", None)
+        if self.journal_mode is not None:
+            mode = self.journal_mode.upper()
+            if mode not in _JOURNAL_MODES:
+                raise ValueError(
+                    f"非法 journal_mode: {self.journal_mode!r}，可选 "
+                    + ", ".join(sorted(m.lower() for m in _JOURNAL_MODES)))
+            self.journal_mode = mode
         self.kwargs = kwargs
         self._conn: Optional[sqlite3.Connection] = None
         self._in_transaction = False
@@ -42,6 +62,9 @@ class Connection:
             self._conn = sqlite3.connect(self.database, **kwargs)
             self._conn.row_factory = sqlite3.Row
             self._conn.execute("PRAGMA foreign_keys = ON")
+            # WAL 等 journal_mode：仅文件库有效，内存库自动跳过
+            if self.journal_mode and self.database != ":memory:":
+                self._conn.execute(f"PRAGMA journal_mode = {self.journal_mode}")
         return self._conn
 
     def close(self) -> None:
@@ -72,7 +95,7 @@ class Connection:
             rows = cur.fetchall()
         finally:
             cur.close()
-        self.sql_log.append((sql, tuple(params)))
+        self._log(sql, params)
         return [dict(r) for r in rows]
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
@@ -83,7 +106,7 @@ class Connection:
         cur = self.conn.execute(sql, tuple(params))
         rowcount = cur.rowcount
         cur.close()
-        self.sql_log.append((sql, tuple(params)))
+        self._log(sql, params)
         if not self._in_transaction:
             self.conn.commit()
         return rowcount
@@ -93,10 +116,29 @@ class Connection:
         cur = self.conn.execute(sql, tuple(params))
         lastrowid = cur.lastrowid
         cur.close()
-        self.sql_log.append((sql, tuple(params)))
+        self._log(sql, params)
         if not self._in_transaction:
             self.conn.commit()
         return lastrowid
+
+    def _log(self, sql: str, params: Sequence[Any]) -> None:
+        """记录 SQL 日志，受开关与上限约束（关闭时零开销）。"""
+        if not self.sql_log_enabled:
+            return
+        log = self.sql_log
+        log.append((sql, tuple(params)))
+        if self.sql_log_max is not None and len(log) > self.sql_log_max:
+            del log[: len(log) - self.sql_log_max]
+
+    def sql_log_disable(self) -> None:
+        """关闭 SQL 日志（生产环境推荐）：省去记录开销并释放已占内存。"""
+        self.sql_log_enabled = False
+        self.sql_log.clear()
+
+    def sql_log_enable(self, max_size: Optional[int] = DEFAULT_SQL_LOG_MAX) -> None:
+        """开启 SQL 日志。``max_size`` 为保留条数上限，None 表示不限制。"""
+        self.sql_log_enabled = True
+        self.sql_log_max = max_size
 
     def get_last_sql(self) -> str:
         """最近一条 SQL（含参数占位），仅日志用途。"""

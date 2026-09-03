@@ -18,3 +18,7 @@ env/
 .idea/
 .vscode/
 .DS_Store
+
+# 本地生成物（文档导出 / 基准原始输出，不入库）
+/TinkPyORM.html
+/benchmark_results.json
