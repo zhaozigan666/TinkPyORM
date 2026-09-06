@@ -1,151 +1,176 @@
-"""SQLite 连接管理（基于标准库 sqlite3）。
+"""数据库连接门面（语义层）。
 
-对应 think-orm 的 Connection 层：负责连接建立/复用、SQL 执行、
-参数绑定、事务（含 savepoint 嵌套）、SQL 日志。
+职责：SQL 日志、事务状态机、自增主键 / 影响行数的语义封装。
+具体执行与 SQL 方言差异全部委派给 :mod:`tinkpyorm.drivers` 中的驱动实现，
+因此新增数据库类型时本文件无需改动。
+
+参数::
+
+    Connection(':memory:')                  # 内存库
+    Connection('app.db')                    # 文件库
+    Connection('app.db', check_same_thread=False)  # 多线程共享
+    Connection.from_config(Config.from_dsn('sqlite:///app.db'))
 """
 from __future__ import annotations
 
-import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
+from .config import Config, SQLITE_CONNECT_KEYS
+from .drivers import Driver, get_driver
 from .exceptions import TransactionError
 
 # SQL 日志默认保留条数上限（环形裁剪）。长驻进程若不限制，
 # 每条 SQL 约 220 字节，百万次操作将累积数百 MB 且永不释放。
 DEFAULT_SQL_LOG_MAX = 1000
 
-# 合法 journal_mode（对应 SQLite PRAGMA journal_mode）
-_JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
-
 
 class Connection:
-    """SQLite 连接封装。
+    """数据库连接（内部持有 :class:`Config` 与 :class:`Driver`）。"""
 
-    参数::
-
-        Connection(':memory:')                  # 内存库
-        Connection('app.db')                    # 文件库
-        Connection('app.db', check_same_thread=False)  # 多线程共享
-    """
-
-    def __init__(self, database: str = ":memory:", **kwargs: Any):
-        self.database = database
-        # SQL 日志开关与上限；sql_log_max=None 表示不限制（旧行为）
-        self.sql_log_enabled: bool = bool(kwargs.pop("sql_log_enabled", True))
-        self.sql_log_max: Optional[int] = kwargs.pop(
-            "sql_log_max", DEFAULT_SQL_LOG_MAX)
-        # 连接建立后执行的 PRAGMA journal_mode（如 "WAL"）；None 表示不设置
-        self.journal_mode: Optional[str] = kwargs.pop("journal_mode", None)
-        if self.journal_mode is not None:
-            mode = self.journal_mode.upper()
-            if mode not in _JOURNAL_MODES:
-                raise ValueError(
-                    f"非法 journal_mode: {self.journal_mode!r}，可选 "
-                    + ", ".join(sorted(m.lower() for m in _JOURNAL_MODES)))
-            self.journal_mode = mode
-        self.kwargs = kwargs
-        self._conn: Optional[sqlite3.Connection] = None
+    def __init__(self, database: str = ":memory:",
+                 config: Optional[Config] = None, **kwargs: Any):
+        if config is None:
+            # 兼容旧式构造：位置/关键字参数转换为等价的配置对象
+            sql_log_enabled = bool(kwargs.pop("sql_log_enabled", True))
+            sql_log_max = kwargs.pop("sql_log_max", DEFAULT_SQL_LOG_MAX)
+            journal_mode = kwargs.pop("journal_mode", None)
+            options = dict(kwargs)
+            if journal_mode is not None:
+                options["journal_mode"] = journal_mode
+            config = Config(
+                database=database,
+                type="sqlite",
+                options=options,
+                sql_log_enabled=sql_log_enabled,
+                sql_log_max=sql_log_max,
+            )
+        self.config: Config = config
+        # 驱动实例化时校验驱动专属参数（如 SQLite 的 journal_mode）
+        self.driver: Driver = get_driver(config.type)(config)
         self._in_transaction = False
         self._savepoint_depth = 0
         self.sql_log: List[Tuple[str, tuple]] = []
 
     # ------------------------------------------------------------------ #
-    # 连接管理
+    # 构造入口
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def from_config(cls, config: Config) -> "Connection":
+        """由配置对象建立连接（配置层的统一构造入口）。
+
+        配置中非通用键已归入 ``config.options``，由驱动按白名单取用，
+        避免未知参数透传给底层驱动。
+        """
+        # 先解析驱动，给出"依赖未安装"等明确提示
+        get_driver(config.type)
+        return cls(config=config)
+
+    # ------------------------------------------------------------------ #
+    # 兼容属性（v0.2.0 既有访问方式）
     # ------------------------------------------------------------------ #
     @property
-    def conn(self) -> sqlite3.Connection:
-        """懒建立连接。"""
-        if self._conn is None:
-            kwargs = dict(self.kwargs)
-            kwargs.setdefault("check_same_thread", False)
-            self._conn = sqlite3.connect(self.database, **kwargs)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA foreign_keys = ON")
-            # WAL 等 journal_mode：仅文件库有效，内存库自动跳过
-            if self.journal_mode and self.database != ":memory:":
-                self._conn.execute(f"PRAGMA journal_mode = {self.journal_mode}")
-        return self._conn
+    def database(self) -> str:
+        return self.config.database
 
+    @database.setter
+    def database(self, value: str) -> None:
+        self.config.database = value
+
+    @property
+    def journal_mode(self) -> Optional[str]:
+        """当前 journal_mode（SQLite 专有，其它驱动为 None）。"""
+        return getattr(self.driver, "journal_mode", None)
+
+    @property
+    def kwargs(self) -> Dict[str, Any]:
+        """底层驱动的透传参数（SQLite 为 sqlite3.connect 参数）。"""
+        return {k: v for k, v in self.config.options.items()
+                if k in SQLITE_CONNECT_KEYS}
+
+    @property
+    def conn(self) -> Any:
+        """底层原生连接（懒建立）。"""
+        return self.driver.raw_connection
+
+    # ------------------------------------------------------------------ #
+    # 连接管理
+    # ------------------------------------------------------------------ #
     def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
+        self.driver.close()
         self._in_transaction = False
         self._savepoint_depth = 0
 
+    def ping(self) -> bool:
+        """连接是否可用。"""
+        return self.driver.ping()
+
+    @property
+    def connected(self) -> bool:
+        """底层连接是否已建立（未连接 / 已关闭均为 False）。"""
+        return self.driver.is_connected()
+
     def table_exists(self, table: str) -> bool:
-        row = self.query(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", (table,)
-        )
-        return bool(row)
+        return self.driver.table_exists(table)
 
     def table_fields(self, table: str) -> List[str]:
         """返回表的所有列名（缓存由调用方负责）。"""
-        rows = self.query(f"PRAGMA table_info({_quote(table)})")
-        return [r["name"] for r in rows]
+        return self.driver.table_fields(table)
 
     # ------------------------------------------------------------------ #
     # SQL 执行
     # ------------------------------------------------------------------ #
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[dict]:
         """执行 SELECT 类语句，返回 dict 列表（无结果返回空列表）。"""
-        cur = self.conn.execute(sql, tuple(params))
-        try:
-            rows = cur.fetchall()
-        finally:
-            cur.close()
+        rows = self.driver.select(sql, params)
         self._log(sql, params)
-        return [dict(r) for r in rows]
+        return rows
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         """执行写语句（INSERT/UPDATE/DELETE/DDL），返回影响行数。
 
         非显式事务时自动提交（对应 think-orm 的自动提交行为）。
         """
-        cur = self.conn.execute(sql, tuple(params))
-        rowcount = cur.rowcount
-        cur.close()
+        rowcount = self.driver.execute(sql, params)
         self._log(sql, params)
         if not self._in_transaction:
-            self.conn.commit()
+            self.driver.commit()
         return rowcount
 
     def insert(self, sql: str, params: Sequence[Any] = ()) -> int:
         """执行 INSERT，返回 lastrowid（自增主键）。"""
-        cur = self.conn.execute(sql, tuple(params))
-        lastrowid = cur.lastrowid
-        cur.close()
+        lastrowid = self.driver.insert(sql, params)
         self._log(sql, params)
         if not self._in_transaction:
-            self.conn.commit()
+            self.driver.commit()
         return lastrowid
 
     def _log(self, sql: str, params: Sequence[Any]) -> None:
         """记录 SQL 日志，受开关与上限约束（关闭时零开销）。"""
-        if not self.sql_log_enabled:
+        if not self.config.sql_log_enabled:
             return
         log = self.sql_log
         log.append((sql, tuple(params)))
-        if self.sql_log_max is not None and len(log) > self.sql_log_max:
-            del log[: len(log) - self.sql_log_max]
+        max_size = self.config.sql_log_max
+        if max_size is not None and len(log) > max_size:
+            del log[: len(log) - max_size]
 
     def sql_log_disable(self) -> None:
         """关闭 SQL 日志（生产环境推荐）：省去记录开销并释放已占内存。"""
-        self.sql_log_enabled = False
+        self.config.sql_log_enabled = False
         self.sql_log.clear()
 
     def sql_log_enable(self, max_size: Optional[int] = DEFAULT_SQL_LOG_MAX) -> None:
         """开启 SQL 日志。``max_size`` 为保留条数上限，None 表示不限制。"""
-        self.sql_log_enabled = True
-        self.sql_log_max = max_size
+        self.config.sql_log_enabled = True
+        self.config.sql_log_max = max_size
 
     def get_last_sql(self) -> str:
         """最近一条 SQL（含参数占位），仅日志用途。"""
         if not self.sql_log:
             return ""
         sql, params = self.sql_log[-1]
-        return self._render(sql, params)
+        return self.driver.render_sql(sql, params)
 
     def sql_log_clear(self) -> None:
         self.sql_log.clear()
@@ -168,24 +193,24 @@ class Connection:
         if self._in_transaction:
             self._savepoint_depth += 1
             sp = f"tinkpyorm_sp_{self._savepoint_depth}"
-            self.conn.execute(f"SAVEPOINT {sp}")
+            self.driver.savepoint(sp)
             try:
                 yield self
             except BaseException:
-                self.conn.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                self.driver.rollback_to(sp)
                 raise
             finally:
-                self.conn.execute(f"RELEASE SAVEPOINT {sp}")
+                self.driver.release(sp)
                 self._savepoint_depth -= 1
             return
 
-        self.conn.execute("BEGIN")
+        self.driver.begin()
         self._in_transaction = True
         try:
             yield self
-            self.conn.commit()
+            self.driver.commit()
         except BaseException:
-            self.conn.rollback()
+            self.driver.rollback()
             raise
         finally:
             self._in_transaction = False
@@ -194,24 +219,28 @@ class Connection:
     def begin(self) -> None:
         if self._in_transaction:
             raise TransactionError("已有事务在进行中，请使用 savepoint 或嵌套事务")
-        self.conn.execute("BEGIN")
+        self.driver.begin()
         self._in_transaction = True
 
     def commit(self) -> None:
         if not self._in_transaction:
             raise TransactionError("当前没有进行中的事务")
-        self.conn.commit()
+        self.driver.commit()
         self._in_transaction = False
 
     def rollback(self) -> None:
         if not self._in_transaction:
             raise TransactionError("当前没有进行中的事务")
-        self.conn.rollback()
+        self.driver.rollback()
         self._in_transaction = False
 
     @staticmethod
     def _render(sql: str, params: Sequence[Any]) -> str:
-        """把参数内联进 SQL，仅供日志/调试展示（非执行）。"""
+        """把参数内联进 SQL，仅供日志/调试展示（非执行）。
+
+        保留为静态方法以兼容旧调用；实际日志渲染由驱动的 ``render_sql``
+        完成，以便适配不同占位符风格（? / %s / :1）。
+        """
         out, idx = [], 0
         for ch in sql:
             if ch == "?" and idx < len(params):
@@ -227,23 +256,24 @@ class Connection:
                 out.append(ch)
         return "".join(out)
 
-
-def _quote(ident: str) -> str:
-    return f"`{ident.replace('`', '``')}`"
-
-
-# 默认全局连接（Db 门面使用）
-_default_connection: Optional[Connection] = None
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"<Connection {self.config.dsn()}>"
 
 
+# 默认全局连接（遗留接口，状态统一托管给 manager）
 def get_default_connection() -> Connection:
-    global _default_connection
-    if _default_connection is None:
-        _default_connection = Connection()
-    return _default_connection
+    """返回默认连接。
+
+    v0.3.0 起状态由 :mod:`tinkpyorm.manager` 统一管理，此处仅作兼容转发，
+    消除原先 "Db._connections 与 _default_connection 两套状态" 的问题。
+    """
+    from .manager import manager
+    return manager.connection()
 
 
 def set_default_connection(conn: Connection) -> Connection:
-    global _default_connection
-    _default_connection = conn
+    """把连接登记为 default（兼容旧接口，等价于 ``Db.set_config(conn)``）。"""
+    from .manager import manager
+    manager.register_connection("default", conn)
+    manager.set_default("default")
     return conn

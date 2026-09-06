@@ -9,7 +9,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .connection import Connection
 from .exceptions import QueryError
-from .utils import Raw, quote_ident, parse_field, parse_order, is_raw
+from .utils import Raw, parse_field, parse_order, is_raw
 
 __all__ = ["Builder", "RawWhere"]
 
@@ -42,6 +42,8 @@ class Builder:
 
     def __init__(self, conn: Connection):
         self.conn = conn
+        # 标识符引用统一走驱动方言（SQLite/PostgreSQL/MSSQL 各异）
+        self._qi = conn.driver.quote_identifier
 
     # ------------------------------------------------------------------ #
     # SELECT
@@ -101,17 +103,17 @@ class Builder:
             alias = t.get("alias")
             name = t["name"]
             if "." in name:
-                name = ".".join(quote_ident(x) for x in name.split("."))
+                name = ".".join(self._qi(x) for x in name.split("."))
             else:
-                name = quote_ident(name)
-            parts.append(f"{name} {quote_ident(alias)}" if alias else name)
+                name = self._qi(name)
+            parts.append(f"{name} {self._qi(alias)}" if alias else name)
         return ", ".join(parts)
 
     def _build_field(self, options: dict) -> str:
         fields = options.get("field")
         without = options.get("without_field")
         if fields:
-            return ", ".join(parse_field(fields))
+            return ", ".join(parse_field(fields, self._qi))
         if without:
             # SQLite 不支持 SELECT * EXCEPT：基于表结构生成排除后的字段列表
             tables = options.get("table") or []
@@ -121,14 +123,14 @@ class Builder:
             if table.startswith("("):  # 子查询场景不处理
                 raise QueryError("without_field 不支持子查询表")
             try:
-                all_fields = [r["name"] for r in self.conn.query(f"PRAGMA table_info({quote_ident(table)})")]
+                all_fields = [r["name"] for r in self.conn.query(f"PRAGMA table_info({self._qi(table)})")]
             except Exception:
                 raise QueryError("without_field 需要表已存在以读取表结构")
             exclude = set(without) if isinstance(without, (list, tuple, set)) else {f.strip() for f in str(without).split(",") if f.strip()}
             keep = [f for f in all_fields if f not in exclude]
             if not keep:
                 raise QueryError("without_field 排除后无可用字段")
-            return ", ".join(quote_ident(f) for f in keep)
+            return ", ".join(self._qi(f) for f in keep)
         return "*"
 
     # ------------------------------------------------------------------ #
@@ -189,7 +191,7 @@ class Builder:
                     return self._field_condition(field, rest[0])
                 op, value = rest
                 if isinstance(op, str) and op.lower() in _OPS:
-                    return self._parse_op(quote_ident(field), op, value)
+                    return self._parse_op(self._qi(field), op, value)
                 return self._field_condition(field, rest)
             # 其他 tuple 视为条件组
             return self._cond_group(list(cond))
@@ -211,7 +213,7 @@ class Builder:
         return " AND ".join(parts), params
 
     def _field_condition(self, field: Any, value: Any) -> Tuple[str, list]:
-        field_sql = quote_ident(field) if isinstance(field, str) else str(field)
+        field_sql = self._qi(field) if isinstance(field, str) else str(field)
         # 1) 原生表达式值
         if is_raw(value):
             return f"{field_sql} = {value.value}", []
@@ -223,7 +225,7 @@ class Builder:
         if isinstance(value, (list, tuple, set)):
             if not value:
                 return "1 = 0", []
-            marks = ", ".join("?" * len(value))
+            marks = self.conn.driver.placeholder(len(value))
             return f"{field_sql} IN ({marks})", list(value)
         # 4) None -> IS NULL
         if value is None:
@@ -247,12 +249,12 @@ class Builder:
         if op == "in":
             if not value:
                 return "1 = 0", []
-            marks = ", ".join("?" * len(value))
+            marks = self.conn.driver.placeholder(len(value))
             return f"{field_sql} IN ({marks})", list(value)
         if op == "not in":
             if not value:
                 return "1 = 1", []
-            marks = ", ".join("?" * len(value))
+            marks = self.conn.driver.placeholder(len(value))
             return f"{field_sql} NOT IN ({marks})", list(value)
         if op == "between":
             return f"{field_sql} BETWEEN ? AND ?", list(value)
@@ -312,7 +314,7 @@ class Builder:
                 raise QueryError(f"不支持的 JOIN 类型: {jtype}")
             table = j["table"]
             t = j.get("alias")
-            name = f"{quote_ident(table)} {quote_ident(t)}" if t else quote_ident(table)
+            name = f"{self._qi(table)} {self._qi(t)}" if t else self._qi(table)
             on = j.get("on")
             if callable(on):
                 # 闭包: on(lambda q: q.where_column('a.user_id', '=', 'u.id'))
@@ -341,7 +343,7 @@ class Builder:
         if isinstance(group, Raw):
             return f"GROUP BY {group.value}"
         fields = group if isinstance(group, (list, tuple)) else [g.strip() for g in str(group).split(",") if g.strip()]
-        return "GROUP BY " + ", ".join(quote_ident(f) for f in fields)
+        return "GROUP BY " + ", ".join(self._qi(f) for f in fields)
 
     def _build_having(self, options: dict) -> Tuple[str, list]:
         having = options.get("having")
@@ -377,7 +379,7 @@ class Builder:
         order = options.get("order")
         if not order:
             return ""
-        parts = parse_order(order)
+        parts = parse_order(order, self._qi)
         if parts:
             return "ORDER BY " + ", ".join(parts)
         return ""
@@ -386,13 +388,15 @@ class Builder:
         limit = options.get("limit")
         if limit is None:
             return ""
+        # 原生片段完全由调用方负责（驱动不解释 Raw）
         if isinstance(limit, Raw):
             return f"LIMIT {limit.value}"
+        driver = self.conn.driver
         if isinstance(limit, (list, tuple)):
             if len(limit) == 1:
-                return f"LIMIT {int(limit[0])}"
-            return f"LIMIT {int(limit[0])} OFFSET {int(limit[1])}"
-        return f"LIMIT {int(limit)}"
+                return driver.limit_sql(limit[0])
+            return driver.limit_sql(limit[0], limit[1])
+        return driver.limit_sql(limit)
 
     # ------------------------------------------------------------------ #
     # INSERT / UPDATE / DELETE
@@ -400,8 +404,8 @@ class Builder:
     def insert(self, options: dict, data: dict) -> Tuple[str, list]:
         table = self._build_table(options)
         fields = list(data.keys())
-        marks = ", ".join("?" * len(fields))
-        cols = ", ".join(quote_ident(f) for f in fields)
+        marks = self.conn.driver.placeholder(len(fields))
+        cols = ", ".join(self.conn.driver.quote_identifier(f) for f in fields)
         sql = f"INSERT INTO {table} ({cols}) VALUES ({marks})"
         return sql, [data[f] for f in fields]
 
@@ -414,10 +418,10 @@ class Builder:
         for row in data_list:
             if set(row.keys()) != set(fields):
                 raise QueryError("insert_all 各行字段必须一致")
-        cols = ", ".join(quote_ident(f) for f in fields)
+        cols = ", ".join(self._qi(f) for f in fields)
         rows_sql, params = [], []
         for row in data_list:
-            rows_sql.append("(" + ", ".join("?" * len(fields)) + ")")
+            rows_sql.append("(" + self.conn.driver.placeholder(len(fields)) + ")")
             params.extend(row[f] for f in fields)
         sql = f"INSERT INTO {table} ({cols}) VALUES {', '.join(rows_sql)}"
         return sql, params
@@ -427,9 +431,9 @@ class Builder:
         set_sql, set_params = [], []
         for field, value in data.items():
             if is_raw(value):
-                set_sql.append(f"{quote_ident(field)} = {value.value}")
+                set_sql.append(f"{self._qi(field)} = {value.value}")
             else:
-                set_sql.append(f"{quote_ident(field)} = ?")
+                set_sql.append(f"{self._qi(field)} = ?")
                 set_params.append(value)
         where_sql, where_params = self.build_where(options.get("where", []))
         if not where_sql:

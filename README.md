@@ -1096,6 +1096,24 @@ TinkPyORM/
 
 ## 更新记录
 
+### v0.3.0
+
+**架构：集中式配置 + 驱动抽象层**（详见 `docs/config-and-driver-refactor.md`）：
+
+1. **`Config` + `DatabaseManager` 集中式配置** —— 修复 `Db.set_config` 时代"双状态不同步"的根因
+   （`Db._connections` 与 `connection._default_connection` 两套独立状态未注册时静默回退内存库）。
+   新增 `Config`（dict / DSN / env / file 四种来源）、`DatabaseManager`（命名注册 + 懒连接），
+   推荐在应用启动时调用一次 `tinkpyorm.configure({...})`，之后任意模块直接 `Db.table(...)` /
+   `tinkpyorm.connection()` 共享。
+2. **驱动抽象层 `tinkpyorm.drivers`** —— 把 SQL 方言（占位符 `?` / `%s` / `:1`、标识符引用
+   `` `x` `` / `"x"` / `[x]`、`LIMIT n OFFSET m`）下沉到 `Driver` 接口，新增数据库类型时只需
+   实现一份驱动 + 注册，无需改动 `Connection` / `Builder` / `Query` / `Model`。`Builder`
+   中 5 处硬编码 `?` 和 LIMIT 全部走 `driver.placeholder()` 与 `driver.limit_sql()`；
+4. **`Query` 延迟解析连接** —— `Db.table(...)` 不再要求 `configure()` 已先调用；Query 句柄
+   可先建，配置后置仍生效，消除导入顺序敏感。
+5. **公开 API 零变更** —— `Db.set_config` 降级为兼容包装，33 项既有测试 + 48 项配置层新测
+   + 9 项驱动层新测 + 112 项 README 示例全量通过。
+
 ### v0.2.0
 
 健壮性与性能（基于与原生 sqlite3 的 15 场景基准评估，详见 `PERFORMANCE.md`）：

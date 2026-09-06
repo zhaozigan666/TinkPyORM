@@ -12,7 +12,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from .builder import Builder, RawWhere
 from .connection import Connection
 from .exceptions import DataNotFound, QueryError
-from .utils import Raw, raw, quote_ident, to_snake
+from .utils import Raw, raw, to_snake
 
 CacheValue = Tuple[float, Any]
 
@@ -27,12 +27,17 @@ class Query:
         self,
         conn: Optional[Connection] = None,
         table: Optional[str] = None,
-        prefix: str = "",
+        prefix: Optional[str] = None,
         model: Optional[type] = None,
+        conn_name: Optional[str] = None,
     ):
         self.conn = conn
         self.builder = Builder(conn) if conn else None
+        # prefix=None 表示"延迟解析"：执行时按连接名从配置取，
+        # 使 Query 可以先构造、后 configure（消除导入顺序依赖）。
         self.prefix = prefix
+        # conn=None 时延迟解析连接（按 conn_name 从注册中心取）
+        self.conn_name = conn_name
         self.model = model  # 绑定的模型类（结果自动转换为模型实例）
         self.options: dict = {
             "table": [],        # [{'name':..., 'alias':...}, ...]
@@ -77,7 +82,7 @@ class Query:
 
     def name(self, table: str) -> "Query":
         """指定表名（自动补前缀）。"""
-        return self.table(self.prefix + table)
+        return self.table(self._resolved_prefix() + table)
 
     def alias(self, alias: str) -> "Query":
         """设置当前表别名。"""
@@ -196,7 +201,8 @@ class Query:
 
     def where_column(self, field1: str, op: str, field2: str) -> "Query":
         """字段对字段比较: where_column('a.id', '=', 'b.user_id')。"""
-        return self._where("AND", Raw(f"{quote_ident(field1)} {op.upper()} {quote_ident(field2)}"))
+        qi = self._resolve_conn().driver.quote_identifier
+        return self._where("AND", Raw(f"{qi(field1)} {op.upper()} {qi(field2)}"))
 
     def where_raw(self, sql: str, params: Sequence[Any] = ()) -> "Query":
         """原生条件 + 参数绑定: where_raw('status = ? AND level > ?', [1, 3])。"""
@@ -352,7 +358,8 @@ class Query:
     def copy(self) -> "Query":
         """复制查询对象（便于复用不串条件）。"""
         import copy as _copy
-        q = Query(self.conn, prefix=self.prefix, model=self.model)
+        q = Query(self.conn, prefix=self._resolved_prefix(), model=self.model,
+                  conn_name=self.conn_name)
         q.options = _copy.deepcopy(self.options)
         q._cache_store = self._cache_store
         return q
@@ -361,11 +368,26 @@ class Query:
     # 终端方法：读取
     # ------------------------------------------------------------------ #
     def _resolve_conn(self) -> Connection:
+        """解析连接。未显式给出连接对象时，按连接名从注册中心取（懒解析）。
+
+        这样 Query 可以先构造、后 configure，不再依赖模块导入顺序。
+        """
         if self.conn is None:
-            from .connection import get_default_connection
-            self.conn = get_default_connection()
+            from .manager import manager
+            self.conn = manager.connection(self.conn_name)
             self.builder = Builder(self.conn)
         return self.conn
+
+    def _resolved_prefix(self) -> str:
+        """解析表前缀。未显式给出时按连接名从配置取（懒解析）。"""
+        if self.prefix is not None:
+            return self.prefix
+        if self.conn_name:
+            from .manager import manager
+            cfg = manager.configs().get(self.conn_name)
+            if cfg is not None:
+                return cfg.prefix
+        return ""
 
     def _apply_soft_delete(self) -> None:
         """模型软删除：自动追加 delete_time IS NULL（仅一次）。"""
@@ -496,10 +518,11 @@ class Query:
         return self._aggregate("MIN", field)
 
     def _aggregate(self, fn: str, field: str) -> Any:
+        qi = self._resolve_conn().driver.quote_identifier
         if field == "*":
             expr = "COUNT(*)"
         else:
-            expr = f"{fn}({quote_ident(field)})"
+            expr = f"{fn}({qi(field)})"
         q = self.copy()
         q.options["field"] = Raw(expr)
         q.options["limit"] = None
@@ -622,11 +645,13 @@ class Query:
 
     def inc(self, field: str, step: int = 1) -> int:
         """字段自增。"""
-        return self.update({field: raw(f"{quote_ident(field)} + {int(step)}")})
+        qi = self._resolve_conn().driver.quote_identifier
+        return self.update({field: raw(f"{qi(field)} + {int(step)}")})
 
     def dec(self, field: str, step: int = 1) -> int:
         """字段自减。"""
-        return self.update({field: raw(f"{quote_ident(field)} - {int(step)}")})
+        qi = self._resolve_conn().driver.quote_identifier
+        return self.update({field: raw(f"{qi(field)} - {int(step)}")})
 
     def get_last_sql(self) -> str:
         return conn_render(self._last_sql, self._last_params)
