@@ -177,7 +177,7 @@ class Driver(abc.ABC):
         return "'" + str(value).replace("'", "''") + "'"
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"<{self.__class__.__name__} {self.config.dsn()}>"
+        return f"<{self.__class__.__name__} {self.config.type}:{self.config.database}>"
 
 
 class SQLDriver(Driver):

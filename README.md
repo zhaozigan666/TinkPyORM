@@ -1096,6 +1096,26 @@ TinkPyORM/
 
 ## 更新记录
 
+### v0.3.1
+
+**撤销 v0.3.0 的集中式配置机制，保留驱动抽象层**（依使用反馈：集中式配置对单库
+SQLite 场景过于复杂）：
+
+1. **配置入口收敛回 `Db.set_config`** —— 移除 `Config` / `DatabaseManager` / `manager` /
+   包级 `configure()` / `connection()` 以及 DSN / 环境变量 / 配置文件四种来源；
+   `Db._connections` 恢复为唯一状态源，任意模块调用一次 `Db.set_config({...})` 即全局共享，
+   用法与 v0.2.0 完全一致。
+2. **保留并独立 `tinkpyorm.drivers` 驱动抽象层** —— `Connection` 委派 `Driver`、
+   `Builder`/`Query` 方言下沉（`placeholder()` / `quote_identifier()` / `limit_sql()`）
+   全部保留；`config.py` 裁剪为内部值对象（不再导出），删除 `manager.py`。
+3. **保留的修复性行为** —— 未知 `type` 立即报错、未知键归入驱动 options 不再透传
+   `sqlite3.connect()`、SQL 日志上限与开关、`insert_all` 自动分批、`find()` 快路径、
+   `journal_mode` 配置。默认连接未配置时仍回退匿名内存库（v0.2.0 兼容行为）。
+4. **兼容性** —— `Db.set_config` / `Connection()` 旧写法零改动；33 项既有测试 +
+   9 项驱动层测试 + 112 项 README 示例全量通过。公开 API 移除项：`Config`、
+   `DatabaseManager`、`configure()`、`connection()`、`parse_dsn`、`load_file`、
+   `ConfigError`、`ConnectionNotFound`。
+
 ### v0.3.0
 
 **架构：集中式配置 + 驱动抽象层**（详见 `docs/config-and-driver-refactor.md`）：

@@ -29,20 +29,5 @@ class InvalidArgumentException(OrmError):
     """参数错误。"""
 
 
-class ConfigError(OrmError):
-    """配置错误：连接未注册、配置项非法、驱动不可用等。"""
-
-
-class DriverNotAvailable(ConfigError):
+class DriverNotAvailable(OrmError):
     """驱动未安装或未提供实现（如未安装 pymysql 时使用 mysql 驱动）。"""
-
-
-class ConnectionNotFound(ConfigError, KeyError):
-    """具名连接未注册。
-
-    同时继承 ``KeyError`` 以兼容旧版本 ``Db.get_connection()`` 抛出
-    ``KeyError`` 的行为，旧调用方的 ``except KeyError`` 仍然成立。
-    """
-
-    def __str__(self) -> str:  # KeyError.__str__ 会给消息加引号，此处还原
-        return self.args[0] if self.args else ""

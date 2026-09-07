@@ -9,7 +9,7 @@
     Connection(':memory:')                  # 内存库
     Connection('app.db')                    # 文件库
     Connection('app.db', check_same_thread=False)  # 多线程共享
-    Connection.from_config(Config.from_dsn('sqlite:///app.db'))
+    Connection('app.db', journal_mode='WAL')
 """
 from __future__ import annotations
 
@@ -257,23 +257,23 @@ class Connection:
         return "".join(out)
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"<Connection {self.config.dsn()}>"
+        return f"<Connection {self.config.type}:{self.config.database}>"
 
 
-# 默认全局连接（遗留接口，状态统一托管给 manager）
-def get_default_connection() -> Connection:
-    """返回默认连接。
-
-    v0.3.0 起状态由 :mod:`tinkpyorm.manager` 统一管理，此处仅作兼容转发，
-    消除原先 "Db._connections 与 _default_connection 两套状态" 的问题。
-    """
-    from .manager import manager
-    return manager.connection()
+# 默认全局连接（Db 门面 set_config(name="default") 时同步写入）
+_default_connection: Optional["Connection"] = None
 
 
-def set_default_connection(conn: Connection) -> Connection:
-    """把连接登记为 default（兼容旧接口，等价于 ``Db.set_config(conn)``）。"""
-    from .manager import manager
-    manager.register_connection("default", conn)
-    manager.set_default("default")
+def get_default_connection() -> "Connection":
+    """返回默认连接；未设置时自动建立一个匿名内存库（兼容旧行为）。"""
+    global _default_connection
+    if _default_connection is None:
+        _default_connection = Connection()
+    return _default_connection
+
+
+def set_default_connection(conn: "Connection") -> "Connection":
+    """把连接登记为全局默认连接。"""
+    global _default_connection
+    _default_connection = conn
     return conn

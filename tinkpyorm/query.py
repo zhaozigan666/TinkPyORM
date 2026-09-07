@@ -27,17 +27,12 @@ class Query:
         self,
         conn: Optional[Connection] = None,
         table: Optional[str] = None,
-        prefix: Optional[str] = None,
+        prefix: str = "",
         model: Optional[type] = None,
-        conn_name: Optional[str] = None,
     ):
         self.conn = conn
         self.builder = Builder(conn) if conn else None
-        # prefix=None 表示"延迟解析"：执行时按连接名从配置取，
-        # 使 Query 可以先构造、后 configure（消除导入顺序依赖）。
         self.prefix = prefix
-        # conn=None 时延迟解析连接（按 conn_name 从注册中心取）
-        self.conn_name = conn_name
         self.model = model  # 绑定的模型类（结果自动转换为模型实例）
         self.options: dict = {
             "table": [],        # [{'name':..., 'alias':...}, ...]
@@ -358,8 +353,7 @@ class Query:
     def copy(self) -> "Query":
         """复制查询对象（便于复用不串条件）。"""
         import copy as _copy
-        q = Query(self.conn, prefix=self._resolved_prefix(), model=self.model,
-                  conn_name=self.conn_name)
+        q = Query(self.conn, prefix=self.prefix, model=self.model)
         q.options = _copy.deepcopy(self.options)
         q._cache_store = self._cache_store
         return q
@@ -368,26 +362,20 @@ class Query:
     # 终端方法：读取
     # ------------------------------------------------------------------ #
     def _resolve_conn(self) -> Connection:
-        """解析连接。未显式给出连接对象时，按连接名从注册中心取（懒解析）。
+        """解析连接。未显式给出连接对象时，回退到全局默认连接。
 
-        这样 Query 可以先构造、后 configure，不再依赖模块导入顺序。
+        v0.3.1 起配置入口收敛回 ``Db.set_config``（连接在构造时即绑定），
+        此处仅为 ``Query(conn=None)`` 的兜底。
         """
         if self.conn is None:
-            from .manager import manager
-            self.conn = manager.connection(self.conn_name)
+            from .connection import get_default_connection
+            self.conn = get_default_connection()
             self.builder = Builder(self.conn)
         return self.conn
 
     def _resolved_prefix(self) -> str:
-        """解析表前缀。未显式给出时按连接名从配置取（懒解析）。"""
-        if self.prefix is not None:
-            return self.prefix
-        if self.conn_name:
-            from .manager import manager
-            cfg = manager.configs().get(self.conn_name)
-            if cfg is not None:
-                return cfg.prefix
-        return ""
+        """解析表前缀（未显式给出时为空字符串）。"""
+        return self.prefix or ""
 
     def _apply_soft_delete(self) -> None:
         """模型软删除：自动追加 delete_time IS NULL（仅一次）。"""
