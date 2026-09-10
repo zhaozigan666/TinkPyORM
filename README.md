@@ -40,6 +40,9 @@
 - [结果集与分页](#结果集与分页)
 - [camelCase 别名](#camelcase-别名)
 - [调试与 SQL 日志](#调试与-sql-日志)
+- [查询缓存](#查询缓存)
+- [流式读取](#流式读取)
+- [多线程使用](#多线程使用)
 - [性能实践建议](#性能实践建议)
 - [API 速查表](#api-速查表)
 - [与 think-orm 对照表](#与-think-orm-对照表)
@@ -94,6 +97,9 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **嵌套事务** —— 基于 SAVEPOINT，内层回滚不影响外层
 - **结果集与分页** —— `Collection`（`column / where / map / sum / to_json` …）+ `Paginator`
 - **camelCase 别名** —— `whereIn` 自动映射到 `where_in`，PHP/JS 开发者上手无阻
+- **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
+- **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
+- **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
 - **调试友好** —— SQL 日志、`fetch_sql`、最后一条 SQL 查询
 
 ---
@@ -908,6 +914,128 @@ q.conn_render()      # 返回带真实参数值的 SQL 字符串（仅调试用�
 
 ---
 
+## 查询缓存
+
+链式查询调用 `.cache(秒)` 即可缓存结果，参数是**倒计时秒数**，超时自动失效：
+
+```python
+Db.name('data').where({'url': url}).cache(10).find()    # 10 秒内复用同一结果
+Db.table('user').where('status', 1).cache(60).select()  # 60 秒
+Db.table('stat').cache(300).count()
+```
+
+| 方法 | 是否支持缓存 |
+|---|---|
+| `find()` / `find_or_fail()` / `find_or_empty()` | 支持 |
+| `select()` / `select_or_fail()` | 支持 |
+| `value()` / `column()` | 支持（内部走 find/select） |
+| `count()` / `sum()` / `avg()` / `max()` / `min()` | 支持 |
+| `paginate()` | 支持（total 与数据分别缓存） |
+| `chunk()` / `cursor()` | 不缓存（流式读取本身即低内存路径） |
+
+特性与规则：
+
+1. **进程级共享** —— 缓存挂在进程单例上，`Db.name(...)` 每次新建 Query 也能命中，
+   跨模块、跨函数调用共享同一份缓存。
+2. **写操作自动失效** —— `insert / insert_all / update / delete` 会清除**同一库同一表**
+   的全部缓存，因此不会出现"写入后仍读到旧值"。
+3. **裸 SQL 需手动清理** —— `Db.execute('UPDATE ...')` 绕过查询构造器，不触发失效，
+   此时请调用 `Db.clear_cache()`。
+4. **TTL 语义** —— `cache(0)` 表示不缓存（每次穿透）；`cache(-1)` 抛
+   `InvalidArgumentException`；同一条 SQL 的 TTL 以**首次写入缓存时**为准。
+5. **容量上限** —— 默认最多 500 条，超出按 LRU 淘汰（`MemoryCacheStore(max_items=...)`）。
+6. **结果隔离** —— 命中缓存时返回的是副本，修改返回值不会污染缓存内容。
+
+自定义缓存键与后端：
+
+```python
+# 自定义键（按库+表参与失效）
+Db.table('user').where('id', 1).cache(60, 'user:1').find()
+
+# 旧写法仍兼容：cache(key, expire)
+Db.table('user').where('id', 1).cache('user:1', 120).find()
+
+# 替换后端（如接入 Redis / 文件缓存）
+from tinkpyorm import CacheStore, cache
+
+class MyStore(CacheStore):
+    def get(self, key): ...
+    def set(self, key, value, ttl=None): ...
+    def delete(self, key): ...
+    def clear(self, prefix=None): ...
+
+old = cache.set_store(MyStore())
+...
+cache.set_store(old)          # 恢复原来的后端
+
+Db.clear_cache()              # 清空全部缓存
+Db.cache_store().stats()      # {'backend','items','hits','misses','hit_rate'}
+```
+
+> 缓存的是**查询返回的原始行**，命中后仍会重新应用 `json` / `with_attr` / `filter` /
+> 模型转换，因此行为与未命中时完全一致。
+
+---
+
+## 流式读取
+
+大结果集不要一次 `select()` 全量载入内存，按需选择下面两种方式：
+
+```python
+# 1) chunk()：分块，每批独立查询（线程安全），产出 Collection
+for batch in Db.table('log').order('id').chunk(500):
+    for row in batch:
+        ...
+
+# 2) cursor()：真流式，底层 fetchmany，逐行产出 dict（内存恒定）
+for row in Db.table('log').order('id').cursor(chunk_size=1000):
+    ...
+```
+
+| | `chunk(size)` | `cursor(chunk_size)` |
+|---|---|---|
+| 底层实现 | 多次 `LIMIT` 查询 | 游标 `fetchmany` |
+| 连接锁 | 每批持锁（线程安全） | 迭代期间不持锁 |
+| 一致性 | 跨批可能变化；需强一致请包事务 | 同一游标内一致 |
+| 适用场景 | 批量处理 | 只读导出、全表扫描 |
+| 模型绑定 | 每批产出模型集合 | 逐行产出模型实例 |
+
+```python
+# 大表迁移：chunk 读 + insert_all 写，全程低内存
+with Db.transaction():
+    for batch in Db.table('src').chunk(1000):
+        Db.table('dst').insert_all([dict(r) for r in batch])
+```
+
+---
+
+## 多线程使用
+
+SQLite 驱动默认以 `check_same_thread=False` 建立连接，`Connection` 内部使用
+**可重入锁（RLock）** 串行化 SQL 与事务，因此多线程共享同一连接是安全的：
+
+```python
+Db.set_config({'database': 'app.db', 'journal_mode': 'WAL'})
+
+def worker(n):
+    for i in range(100):
+        with Db.transaction():              # 事务期间独占连接（其它线程排队）
+            Db.table('log').insert({'msg': f'{n}-{i}'})
+
+threads = [threading.Thread(target=worker, args=(k,)) for k in range(4)]
+```
+
+要点：
+
+- **事务原子** —— 一个线程的 `commit/rollback` 不会影响另一个线程的事务状态；
+  同线程嵌套事务走 `SAVEPOINT`，可重入不死锁。
+- **事务独占连接** —— 事务期间其它线程的 SQL 排队等待，因此事务内避免耗时 IO。
+- **并发写建议开启 WAL** —— `journal_mode: 'WAL'` 下读不阻塞写。
+- **单线程可关闭锁** —— `Connection('app.db', thread_safe=False)` 省去加锁开销。
+- **更高并发** —— 可为每个线程使用独立 `Connection`（WAL 模式下并发读更佳）。
+
+---
+
 ## 性能实践建议
 
 TinkPyORM 基于标准库 sqlite3，ORM 层的 Python 开销为**微秒量级**（主键点查约 20 µs）。
@@ -980,9 +1108,11 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 | 分组排序 | `group` `having` `having_or` `order` `order_raw` |
 | 限制 | `limit` `page` `paginate` |
 | 查询 | `select` `select_or_fail` `find` `find_or_empty` `find_or_fail` `value` `column` `count` `sum` `avg` `max` `min` `paginate` `explain` |
+| 流式 | `chunk(size)` `cursor(chunk_size)` |
+| 缓存 | `cache(秒[, key])` |
 | 写入 | `insert` `insert_all(list, batch_size=None)` `update` `save` `delete` `inc` `dec` |
 | 关联 | `with_` |
-| 其他 | `cache` `comment` `lock` `fetch_sql` `fail_exception` `allow_empty` `copy` `get_last_sql` |
+| 其他 | `comment` `lock` `fetch_sql` `fail_exception` `allow_empty` `copy` `get_last_sql` |
 
 ### Model（静态）
 
@@ -994,7 +1124,7 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 
 ### Db（门面）
 
-`set_config` `get_connection` `close` `table` `name` `raw` `query` `execute` `transaction` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+`set_config` `get_connection` `close` `table` `name` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
 
 ---
 
@@ -1034,23 +1164,26 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 ## 运行测试
 
 ```bash
-# 单元测试（31 项，覆盖查询构造 / 写入 / 事务 / 模型 / 软删除 / 关联）
-python test_tinkpyorm.py
+# 单元测试
+python test_tinkpyorm.py            # 33 项：查询构造 / 写入 / 事务 / 模型 / 软删除 / 关联
+python test_drivers.py              #  9 项：驱动抽象层（注册表 / 方言钩子）
+python test_cache.py                # 24 项：查询缓存（TTL / 失效 / LRU / 后端替换）
+python test_stream_concurrency.py   # 21 项：流式读取（chunk/cursor）与多线程安全
 
 # 冒烟测试（端到端，覆盖全链路 API）
 python smoke_test.py
 
-# README 示例回归测试（112 项，逐条校验本文档中的用法示例）
+# README 示例回归测试（127 项，逐条校验本文档中的用法示例）
 python test_readme_examples.py
 ```
 
-预期输出：
+预期输出（合计 87 项单元测试 + 127 项示例）：
 
 ```
-Ran 31 tests in 1.6s
+Ran 33 tests in 1.6s
 OK
-冒烟测试全部通过 ✔
-README 示例：通过 112 项，失败 0 项
+...
+README 示例：通过 127 项，失败 0 项
 ```
 
 ---
@@ -1062,17 +1195,25 @@ TinkPyORM/
 ├── tinkpyorm/
 │   ├── __init__.py       # 包导出（版本、公开 API）
 │   ├── exceptions.py     # 异常体系（OrmError / DataNotFound / QueryError …）
-│   ├── utils.py          # Raw/raw、标识符转义、命名转换、字段解析
-│   ├── connection.py     # sqlite3 封装：查询/执行/事务(SAVEPOINT)/SQL 日志
+│   ├── utils.py          # Raw/raw、标识符处理、命名转换、字段解析
+│   ├── config.py         # 连接配置值对象（类型校验、options 归并）
+│   ├── cache.py          # 查询缓存（进程级 + TTL + LRU + 可替换后端）
+│   ├── drivers/          # 驱动抽象层（base / sqlite，可扩展多数据库方言）
+│   ├── connection.py     # 连接门面：查询/执行/事务(SAVEPOINT)/日志/线程锁
 │   ├── builder.py        # SQL 编译器：options → SQL（select/insert/update/delete）
-│   ├── query.py          # 查询构造器：全链式方法 + 预载入 + 结果处理
+│   ├── query.py          # 查询构造器：全链式 + 预载入 + 结果处理 + 缓存/流式
 │   ├── collection.py     # Collection 结果集 + Paginator 分页
 │   ├── relation.py       # 关联实现：4 种类型 + 批量预载入
 │   ├── model.py          # Model 基类 + MetaModel 元类（scope/camelCase/静态代理）
-│   └── db.py             # Db 门面：连接管理、入口、事务、日志
-├── test_tinkpyorm.py        # unittest 测试套件（31 项）
-├── smoke_test.py           # 端到端冒烟测试
-├── test_readme_examples.py # README 示例回归测试（112 项）
+│   └── db.py             # Db 门面：连接管理、入口、事务、日志、缓存
+├── test_tinkpyorm.py           # 核心测试（33 项）
+├── test_drivers.py             # 驱动抽象层测试（9 项）
+├── test_cache.py               # 查询缓存测试（24 项）
+├── test_stream_concurrency.py  # 流式读取与并发测试（21 项）
+├── smoke_test.py               # 端到端冒烟测试
+├── test_readme_examples.py     # README 示例回归测试（127 项）
+├── benchmark_vs_sqlite3.py     # 与原生 sqlite3 的性能对照基准
+├── PERFORMANCE.md              # 性能报告与优化记录
 └── README.md
 ```
 
@@ -1080,11 +1221,11 @@ TinkPyORM/
 
 ## 注意事项与已知限制
 
-1. **仅支持 SQLite**。多数据库（MySQL / PostgreSQL）需要替换 `Builder` 与 `Connection`，当前未实现。
+1. **内置驱动仅 SQLite**。驱动抽象层（`tinkpyorm.drivers`）已就位：新增数据库只需实现一个驱动类并注册，`Connection` / `Builder` / `Query` / `Model` 无需改动；MySQL / PostgreSQL 等驱动尚未提供。
 2. **`with_` 不是 `with`**：`with` 是 Python 保留关键字，预载入方法必须写成 `with_()`。
 3. **`raw()` 不做转义**。它按字面量拼进 SQL，只应传入你自己硬编码的表达式，绝不可传入未校验的用户输入。
 4. **`without_field` 有额外开销**：SQLite 不支持 `SELECT * EXCEPT(col)`，实现上先查 `PRAGMA table_info()` 推导出完整字段列表再剔除，多一次元数据查询。
-5. **`cache()` 是进程内内存缓存**，非 `PSR-16` 那种跨请求持久缓存；进程重启即失效，也不跨进程共享。
+5. **`cache()` 是进程内内存缓存**（v0.4.0 起为进程级共享 + TTL + LRU 上限），非跨进程持久缓存，进程重启即失效。链式查询的写操作会自动清除同库同表缓存，裸 SQL（`Db.execute`）需手动调用 `Db.clear_cache()`。
 6. **`right_join()` 依赖 SQLite 版本**：`RIGHT JOIN` / `FULL JOIN` 需 **SQLite ≥ 3.39**（Python 3.11+ 通常自带 3.39+）。旧版本会报语法错误，此时请改写为 `LEFT JOIN` 或升级 SQLite。
 7. **`withTrashed()` / `onlyTrashed()` 需先启用软删除**：若模型未配置 `__soft_delete__`，调用会抛 `QueryError`。
 8. **`lock()` 在 SQLite 下无实际效果**（SQLite 是文件级锁，`FOR UPDATE` 不适用），保留方法仅为 API 对齐。
@@ -1095,6 +1236,30 @@ TinkPyORM/
 ---
 
 ## 更新记录
+
+### v0.4.0
+
+**查询缓存重做 + 流式读取 + 连接级线程安全**（依能力评估结论落地：P0 两项 + P1 一项）：
+
+1. **查询缓存真正可用** —— 此前 `_cache_store` 挂在 Query 实例上，而 `Db.name()` 每次都
+   新建 Query，导致缓存**从不命中**。新增 `tinkpyorm/cache.py`：进程级单例 + TTL +
+   LRU 容量上限（默认 500 条）+ `RLock` 线程安全 + 可替换后端
+   （`CacheStore` / `MemoryCacheStore` / `cache.set_store()`）。
+2. **`cache(秒)` 语义** —— 第一个参数即"倒计时秒数"：`cache(10)` 表示 10 秒后失效；
+   `cache(0)` 不缓存；仍兼容旧签名 `cache(key, expire)`。缓存范围从仅 `select` 扩展到
+   `find / select / value / column / count / sum / avg / max / min / paginate`。
+3. **写操作自动失效与结果隔离** —— `insert / insert_all / update / delete` 按"库 + 表"
+   前缀清除缓存，裸 SQL 提供 `Db.clear_cache()`；缓存键改为 MD5 摘要（键长恒定），
+   命中时返回副本，修改返回值不再污染缓存。
+4. **连接级线程安全** —— `Connection` 内置可重入锁，串行化 SQL 执行与事务，修复多线程
+   共享同一连接时 `_in_transaction` / `_savepoint_depth` 被交叉覆盖导致的事务语义错乱；
+   `Connection(..., thread_safe=False)` 可关闭锁（单线程省开销）。
+5. **流式读取** —— 新增 `Query.chunk(size)`（分块、每批持锁、线程安全）与
+   `Query.cursor(chunk_size)`（底层 `fetchmany` 真流式、内存恒定）；驱动层新增
+   `Driver.select_stream()`（默认整体分块，SQLite 覆写为真流式）与 `Connection.query_stream()`。
+6. **测试与文档** —— 新增 `test_cache.py`（24 项）、`test_stream_concurrency.py`（21 项），
+   合计 33 + 9 + 24 + 21 项单元测试与 127 项 README 示例全量通过；README 新增
+   「查询缓存」「流式读取」「多线程使用」三节，并修正已知限制中的缓存描述。
 
 ### v0.3.1
 

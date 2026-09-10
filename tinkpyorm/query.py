@@ -6,15 +6,13 @@
 """
 from __future__ import annotations
 
-import time
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
+from . import cache as _cache
 from .builder import Builder, RawWhere
 from .connection import Connection
-from .exceptions import DataNotFound, QueryError
+from .exceptions import DataNotFound, InvalidArgumentException, QueryError
 from .utils import Raw, raw, to_snake
-
-CacheValue = Tuple[float, Any]
 
 # SQLite 单语句绑定变量上限（SQLITE_MAX_VARIABLE_NUMBER）
 MAX_SQL_VARIABLES = 32766
@@ -62,7 +60,6 @@ class Query:
         }
         self._last_sql = ""
         self._last_params: list = []
-        self._cache_store: Dict[str, CacheValue] = {}
         self._soft_applied = False
         if table:
             self.table(table)
@@ -340,9 +337,38 @@ class Query:
                 self.options["with"].append(rel)
         return self
 
-    def cache(self, key: Union[bool, str] = True, expire: int = 60) -> "Query":
-        """查询结果缓存（进程内内存缓存，标准库实现）。"""
-        self.options["cache"] = (key, expire)
+    def cache(self, expire: Union[int, float, bool, str] = 60,
+              key: Optional[Union[bool, str]] = None) -> "Query":
+        """启用查询结果缓存（进程级共享，标准库实现）。
+
+        TTL 语义 —— 第一个参数是"倒计时秒数"，超过即失效::
+
+            Db.name('data').where({'url': url}).cache(10).find()   # 10 秒内复用
+            Db.table('user').where('id', 1).cache(30).select()
+
+        兼容旧的 ``cache(key, expire)`` 写法（第一个参数为 ``str``/``bool``
+        时自动识别为缓存键）::
+
+            q.cache(60)              # 60 秒 TTL（推荐）
+            q.cache('user:1', 120)   # 自定义键 + 120 秒 TTL
+            q.cache(120, 'user:1')   # 同上，新写法
+
+        注意事项：
+
+        - 缓存的是查询返回的**原始行**，命中后仍会重新应用 ``json`` /
+          ``with_attr`` / ``filter`` / 模型转换，行为与未命中时一致。
+        - 写操作（insert / insert_all / update / delete）会自动清除同一库
+          同一表的缓存；裸 SQL（``Db.execute``）不会，需手动调用
+          ``Db.clear_cache()``。
+        - ``expire <= 0`` 视为不缓存（每次穿透到数据库）。
+        """
+        if isinstance(expire, (bool, str)):
+            # 旧签名 cache(key, expire)：第一个位置参数是键
+            expire, key = (key if key is not None else 60), expire
+        ttl = float(expire or 0)
+        if ttl < 0:
+            raise InvalidArgumentException("cache() 的 TTL 不能为负数")
+        self.options["cache"] = (key if key is not None else True, ttl)
         return self
 
     def fetch_sql(self, flag: bool = True) -> "Query":
@@ -355,7 +381,6 @@ class Query:
         import copy as _copy
         q = Query(self.conn, prefix=self.prefix, model=self.model)
         q.options = _copy.deepcopy(self.options)
-        q._cache_store = self._cache_store
         return q
 
     # ------------------------------------------------------------------ #
@@ -398,16 +423,19 @@ class Query:
         if self.options["fetch_sql"]:
             return conn_render(sql, params)
 
-        cache_key, expire = self._cache_key()
-        if cache_key and cache_key in self._cache_store:
-            ts, rows = self._cache_store[cache_key]
-            if time.time() - ts < expire:
-                return self._build_result(rows, sql=False)
-            del self._cache_store[cache_key]
+        cache_key, ttl = self._resolve_cache_key(sql, params)
+        if cache_key:
+            hit, cached = _cache.store().get(cache_key)
+            if hit:
+                # _build_result 内部逐行拷贝（_process_row），不会污染缓存
+                result = self._build_result(cached, sql=False)
+                if self.options["fail_exception"] and len(result) == 0:
+                    raise DataNotFound("查询无结果")
+                return result
 
         rows = self._resolve_conn().query(sql, params)
         if cache_key:
-            self._cache_store[cache_key] = (time.time(), rows)
+            _cache.store().set(cache_key, rows, ttl)
         result = self._build_result(rows)
         if self.options["fail_exception"] and len(result) == 0:
             raise DataNotFound("查询无结果")
@@ -428,7 +456,19 @@ class Query:
         if self.options["fetch_sql"]:
             return conn_render(sql, params)
 
-        rows = self._resolve_conn().query(sql, params)
+        rows: Optional[List[dict]] = None
+        cache_key, ttl = self._resolve_cache_key(sql, params)
+        if cache_key:
+            hit, cached = _cache.store().get(cache_key)
+            if hit:
+                rows = [dict(r) for r in cached]
+        if rows is None:
+            rows = self._resolve_conn().query(sql, params)
+            if cache_key:
+                # 写入副本：find 的快路径会把 rows[0] 直接返回给调用方，
+                # 若缓存与返回值共享同一 dict，调用方的修改会污染缓存。
+                _cache.store().set(cache_key, [dict(r) for r in rows], ttl)
+
         if not rows:
             if self.options["fail_exception"]:
                 raise DataNotFound("查询无结果")
@@ -439,7 +479,7 @@ class Query:
             return None
         # 快路径：纯表查询（无模型绑定、无 json/attr/filter/with 后处理），
         # 直接返回首行，跳过 Collection 包装与结果二次拷贝。
-        # find() 不涉及结果缓存，rows[0] 为本次新建 dict，引用安全。
+        # 缓存命中时 rows 已逐行拷贝，直接返回 rows[0] 不会污染缓存。
         o = self.options
         if self.model is None and not (o["json"] or o["attr"] or o["filter"] or o["with"]):
             return rows[0]
@@ -456,6 +496,59 @@ class Query:
         if len(result) == 0:
             raise DataNotFound("查询无结果")
         return result
+
+    def chunk(self, size: int = 1000) -> Iterator[Any]:
+        """分块迭代查询结果（大批量处理时避免整体载入内存）。
+
+        每批独立执行一次 ``LIMIT`` 查询，每批都受连接锁保护（线程安全）；
+        代价是跨批之间数据可能变化——需要强一致时请在外层包
+        ``Db.transaction()``。建议配合 ``order()``，否则分批顺序不稳定::
+
+            for batch in Db.table('log').order('id').chunk(500):
+                for row in batch:
+                    ...
+
+        每批产出 ``Collection``（绑定模型时为模型集合），与 ``select()`` 一致。
+        """
+        if size <= 0:
+            raise InvalidArgumentException("chunk() 的 size 必须大于 0")
+        base = self.copy()
+        base.options["limit"] = None
+        offset = 0
+        while True:
+            q = base.copy()
+            q.options["limit"] = [size, offset]
+            batch = q.select()
+            if not len(batch):
+                break
+            yield batch
+            if len(batch) < size:
+                break
+            offset += size
+
+    def cursor(self, chunk_size: int = 1000) -> Iterator[Any]:
+        """流式逐行读取（底层 ``fetchmany``，内存占用恒定）。
+
+        与 ``chunk()`` 的区别：本方法在整个游标生命周期内不持有连接锁，
+        因此效率更高，但同一连接上的并发写入可能影响游标结果，适合
+        "只读导出 / 全表扫描" 场景。绑定模型时逐行产出模型实例::
+
+            for row in Db.table('big').order('id').cursor():
+                ...
+
+        需要线程安全的批量处理请改用 :meth:`chunk`。
+        """
+        if chunk_size <= 0:
+            raise InvalidArgumentException("cursor() 的 chunk_size 必须大于 0")
+        sql, params = self._execute_select()
+        if self.options["fetch_sql"]:
+            raise QueryError("fetch_sql 模式下无法流式读取")
+        conn = self._resolve_conn()
+        for raw in conn.query_stream(sql, params, chunk_size):
+            if self.model is not None:
+                yield self.model._from_data(self._process_row(raw))
+            else:
+                yield self._process_row(raw)
 
     def value(self, field: str, default: Any = None) -> Any:
         """取第一条记录的单个字段值。"""
@@ -517,7 +610,16 @@ class Query:
         sql, params = q._execute_select()
         if q.options["fetch_sql"]:
             return conn_render(sql, params)
-        row = q._resolve_conn().query(sql, params)
+        cache_key, ttl = q._resolve_cache_key(sql, params)
+        row: Optional[List[dict]] = None
+        if cache_key:
+            hit, cached = _cache.store().get(cache_key)
+            if hit:
+                row = [dict(r) for r in cached]
+        if row is None:
+            row = q._resolve_conn().query(sql, params)
+            if cache_key:
+                _cache.store().set(cache_key, row, ttl)
         if not row:
             return 0 if fn == "COUNT" else None
         return row[0][expr] if expr in row[0] else list(row[0].values())[0]
@@ -546,7 +648,9 @@ class Query:
         self._last_sql, self._last_params = sql, params
         if self.options["fetch_sql"]:
             return conn_render(sql, params)
-        return conn.insert(sql, params)
+        last_id = conn.insert(sql, params)
+        self._invalidate_cache()
+        return last_id
 
     def insert_all(self, data_list: List[dict], batch_size: Optional[int] = None) -> int:
         """批量插入，返回插入行数。
@@ -572,6 +676,7 @@ class Query:
             if self.options["fetch_sql"]:
                 return conn_render(sql, params)
             conn.execute(sql, params)
+            self._invalidate_cache()
             return len(data_list)
 
         # 多批：先整体校验字段一致性，保证与单批一致的报错行为
@@ -594,6 +699,7 @@ class Query:
                 self._last_sql, self._last_params = sql, params
                 conn.execute(sql, params)
                 total += len(chunk)
+        self._invalidate_cache()
         return total
 
     def update(self, data: Optional[dict] = None) -> int:
@@ -608,7 +714,9 @@ class Query:
         self._last_sql, self._last_params = sql, params
         if self.options["fetch_sql"]:
             return conn_render(sql, params)
-        return conn.execute(sql, params)
+        affected = conn.execute(sql, params)
+        self._invalidate_cache()
+        return affected
 
     def delete(self, id: Optional[Any] = None) -> int:
         """删除数据，返回影响行数。``delete(1)`` 按主键删除。"""
@@ -620,7 +728,9 @@ class Query:
         self._last_sql, self._last_params = sql, params
         if self.options["fetch_sql"]:
             return conn_render(sql, params)
-        return conn.execute(sql, params)
+        affected = conn.execute(sql, params)
+        self._invalidate_cache()
+        return affected
 
     def save(self, data: Optional[dict] = None) -> int:
         """有主键值则更新，否则插入（think-orm Query::save 语义）。"""
@@ -692,36 +802,77 @@ class Query:
             return self.model.__pk__
         return "id"
 
-    def _cache_key(self) -> Tuple[Optional[str], int]:
-        cache = self.options.get("cache")
-        if not cache:
-            return None, 0
-        key, expire = cache
-        if key is True or key is None:
-            sql, params = self._execute_select()
-            key = f"tinkpyorm:{sql}:{params}"
-        return key, expire or 60
+    def _cache_spec(self) -> Tuple[Optional[str], float]:
+        """解析缓存配置，返回 ``(键, TTL 秒)``。
+
+        键为 ``None`` 表示未启用缓存（或 TTL <= 0，即不缓存）；
+        返回空串表示"按 SQL 与参数自动生成键"。
+        """
+        spec = self.options.get("cache")
+        if not spec:
+            return None, 0.0
+        key, ttl = spec
+        ttl = float(ttl or 0)
+        if ttl <= 0:
+            return None, 0.0
+        if isinstance(key, str) and key:
+            return key, ttl
+        return "", ttl
+
+    def _cache_table(self) -> str:
+        """缓存键使用的表名（取首个表，忽略别名）。"""
+        tables = self.options.get("table") or []
+        if tables and isinstance(tables[0], dict):
+            return tables[0].get("name") or ""
+        return ""
+
+    def _cache_database(self) -> str:
+        """缓存键使用的库标识（未绑定连接时为空串）。"""
+        if self.conn is None:
+            return ""
+        return getattr(self.conn.config, "database", "") or ""
+
+    def _resolve_cache_key(self, sql: str, params: Sequence[Any]) -> Tuple[Optional[str], float]:
+        """生成最终缓存键。
+
+        自定义键同样带上"库 + 表"前缀，使写操作能按前缀统一失效。
+        """
+        key, ttl = self._cache_spec()
+        if key is None:
+            return None, 0.0
+        if key == "":
+            return _cache.make_key(self._cache_database(),
+                                   self._cache_table(), sql, params), ttl
+        prefix = _cache.prefix_for(self._cache_database(), self._cache_table())
+        return prefix + "user:" + key, ttl
+
+    def _invalidate_cache(self) -> int:
+        """写操作后清除同一库同一表的全部缓存，返回清除条数。"""
+        prefix = _cache.prefix_for(self._cache_database(), self._cache_table())
+        return _cache.clear(prefix)
+
+    def _process_row(self, row: Any) -> dict:
+        """单行后处理：JSON 解码 -> 获取器（attr）-> filter 回调。"""
+        item = dict(row)
+        for f in self.options["json"]:
+            if f in item and isinstance(item[f], str):
+                import json
+                try:
+                    item[f] = json.loads(item[f])
+                except (ValueError, TypeError):
+                    pass
+        for f, cb in self.options["attr"].items():
+            if f in item:
+                item[f] = cb(item[f])
+        for cb in self.options["filter"]:
+            item = cb(item)
+        return item
 
     def _build_result(self, rows: List[dict], sql: bool = True) -> Any:
         """原始行 -> 应用 json/attr/filter -> (模型实例) 结果集。"""
         from .collection import Collection
 
-        results = []
-        for row in rows:
-            item = dict(row)
-            for f in self.options["json"]:
-                if f in item and isinstance(item[f], str):
-                    import json
-                    try:
-                        item[f] = json.loads(item[f])
-                    except (ValueError, TypeError):
-                        pass
-            for f, cb in self.options["attr"].items():
-                if f in item:
-                    item[f] = cb(item[f])
-            for cb in self.options["filter"]:
-                item = cb(item)
-            results.append(item)
+        results = [self._process_row(row) for row in rows]
 
         if self.model is not None:
             models = [self.model._from_data(r) for r in results]

@@ -1,18 +1,26 @@
 """数据库连接门面（语义层）。
 
-职责：SQL 日志、事务状态机、自增主键 / 影响行数的语义封装。
+职责：SQL 日志、事务状态机、自增主键 / 影响行数的语义封装、跨线程保护。
 具体执行与 SQL 方言差异全部委派给 :mod:`tinkpyorm.drivers` 中的驱动实现，
 因此新增数据库类型时本文件无需改动。
 
 参数::
 
     Connection(':memory:')                  # 内存库
-    Connection('app.db')                    # 文件库
-    Connection('app.db', check_same_thread=False)  # 多线程共享
+    Connection('app.db')                    # 文件库（默认开启线程保护）
     Connection('app.db', journal_mode='WAL')
+    Connection('app.db', thread_safe=False) # 关闭内部锁（单线程可省开销）
+
+线程安全说明：SQLite 驱动默认以 ``check_same_thread=False`` 建立连接，
+允许多线程共享；但 ``_in_transaction`` / ``_savepoint_depth`` 等事务状态
+是共享可变状态，若不加保护，一个线程的 ``commit`` 可能提交另一个线程
+未完成的事务。本类内部使用可重入锁（``RLock``）串行化所有 SQL 执行与
+事务操作，保证事务语义正确；代价是事务期间独占连接（嵌套调用不受影响，
+因为 RLock 可重入）。
 """
 from __future__ import annotations
 
+import threading
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
@@ -29,7 +37,8 @@ class Connection:
     """数据库连接（内部持有 :class:`Config` 与 :class:`Driver`）。"""
 
     def __init__(self, database: str = ":memory:",
-                 config: Optional[Config] = None, **kwargs: Any):
+                 config: Optional[Config] = None,
+                 thread_safe: bool = True, **kwargs: Any):
         if config is None:
             # 兼容旧式构造：位置/关键字参数转换为等价的配置对象
             sql_log_enabled = bool(kwargs.pop("sql_log_enabled", True))
@@ -51,6 +60,19 @@ class Connection:
         self._in_transaction = False
         self._savepoint_depth = 0
         self.sql_log: List[Tuple[str, tuple]] = []
+        # 可重入锁：保护 SQL 执行与事务状态（见模块 docstring）
+        self._thread_safe = bool(thread_safe)
+        self._lock: Optional[threading.RLock] = \
+            threading.RLock() if self._thread_safe else None
+
+    @contextmanager
+    def _guard(self) -> Iterator[None]:
+        """线程保护哨兵；``thread_safe=False`` 时零开销透传。"""
+        if self._lock is None:
+            yield
+        else:
+            with self._lock:
+                yield
 
     # ------------------------------------------------------------------ #
     # 构造入口
@@ -97,9 +119,10 @@ class Connection:
     # 连接管理
     # ------------------------------------------------------------------ #
     def close(self) -> None:
-        self.driver.close()
-        self._in_transaction = False
-        self._savepoint_depth = 0
+        with self._guard():
+            self.driver.close()
+            self._in_transaction = False
+            self._savepoint_depth = 0
 
     def ping(self) -> bool:
         """连接是否可用。"""
@@ -122,27 +145,50 @@ class Connection:
     # ------------------------------------------------------------------ #
     def query(self, sql: str, params: Sequence[Any] = ()) -> List[dict]:
         """执行 SELECT 类语句，返回 dict 列表（无结果返回空列表）。"""
-        rows = self.driver.select(sql, params)
-        self._log(sql, params)
+        with self._guard():
+            rows = self.driver.select(sql, params)
+            self._log(sql, params)
         return rows
+
+    def query_stream(self, sql: str, params: Sequence[Any] = (),
+                     chunk_size: int = 1000) -> Iterator[dict]:
+        """流式执行 SELECT，逐行产出 dict（大结果集不整体载入内存）。
+
+        实现要点：在锁内启动游标（首块数据同时取出），随后**释放锁**继续
+        迭代——流式读取期间只读且不修改事务状态，无需长期独占连接；
+        因此本方法不适合与同一连接上的并发写入同时使用。
+        """
+        with self._guard():
+            stream = self.driver.select_stream(sql, params, chunk_size)
+            first = next(iter(stream), None)
+            self._log(sql, params)
+        if not first:
+            return
+        for row in first:
+            yield row
+        for batch in stream:
+            for row in batch:
+                yield row
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
         """执行写语句（INSERT/UPDATE/DELETE/DDL），返回影响行数。
 
         非显式事务时自动提交（对应 think-orm 的自动提交行为）。
         """
-        rowcount = self.driver.execute(sql, params)
-        self._log(sql, params)
-        if not self._in_transaction:
-            self.driver.commit()
+        with self._guard():
+            rowcount = self.driver.execute(sql, params)
+            self._log(sql, params)
+            if not self._in_transaction:
+                self.driver.commit()
         return rowcount
 
     def insert(self, sql: str, params: Sequence[Any] = ()) -> int:
         """执行 INSERT，返回 lastrowid（自增主键）。"""
-        lastrowid = self.driver.insert(sql, params)
-        self._log(sql, params)
-        if not self._in_transaction:
-            self.driver.commit()
+        with self._guard():
+            lastrowid = self.driver.insert(sql, params)
+            self._log(sql, params)
+            if not self._in_transaction:
+                self.driver.commit()
         return lastrowid
 
     def _log(self, sql: str, params: Sequence[Any]) -> None:
@@ -188,51 +234,56 @@ class Connection:
                 db.execute(...)
                 ...
 
-        异常自动回滚，正常结束自动提交。
+        异常自动回滚，正常结束自动提交。整个事务期间持有连接锁（可重入），
+        其它线程的 SQL 会排队等待，从而避免事务状态被交叉污染。
         """
-        if self._in_transaction:
-            self._savepoint_depth += 1
-            sp = f"tinkpyorm_sp_{self._savepoint_depth}"
-            self.driver.savepoint(sp)
+        with self._guard():
+            if self._in_transaction:
+                self._savepoint_depth += 1
+                sp = f"tinkpyorm_sp_{self._savepoint_depth}"
+                self.driver.savepoint(sp)
+                try:
+                    yield self
+                except BaseException:
+                    self.driver.rollback_to(sp)
+                    raise
+                finally:
+                    self.driver.release(sp)
+                    self._savepoint_depth -= 1
+                return
+
+            self.driver.begin()
+            self._in_transaction = True
             try:
                 yield self
+                self.driver.commit()
             except BaseException:
-                self.driver.rollback_to(sp)
+                self.driver.rollback()
                 raise
             finally:
-                self.driver.release(sp)
-                self._savepoint_depth -= 1
-            return
-
-        self.driver.begin()
-        self._in_transaction = True
-        try:
-            yield self
-            self.driver.commit()
-        except BaseException:
-            self.driver.rollback()
-            raise
-        finally:
-            self._in_transaction = False
-            self._savepoint_depth = 0
+                self._in_transaction = False
+                self._savepoint_depth = 0
 
     def begin(self) -> None:
-        if self._in_transaction:
-            raise TransactionError("已有事务在进行中，请使用 savepoint 或嵌套事务")
-        self.driver.begin()
-        self._in_transaction = True
+        with self._guard():
+            if self._in_transaction:
+                raise TransactionError("已有事务在进行中，请使用 savepoint 或嵌套事务")
+            self.driver.begin()
+            self._in_transaction = True
 
     def commit(self) -> None:
-        if not self._in_transaction:
-            raise TransactionError("当前没有进行中的事务")
-        self.driver.commit()
-        self._in_transaction = False
+        with self._guard():
+            if not self._in_transaction:
+                raise TransactionError("当前没有进行中的事务")
+            self.driver.commit()
+            self._in_transaction = False
 
     def rollback(self) -> None:
-        if not self._in_transaction:
-            raise TransactionError("当前没有进行中的事务")
-        self.driver.rollback()
-        self._in_transaction = False
+        with self._guard():
+            if not self._in_transaction:
+                raise TransactionError("当前没有进行中的事务")
+            self.driver.rollback()
+            self._in_transaction = False
 
     @staticmethod
     def _render(sql: str, params: Sequence[Any]) -> str:

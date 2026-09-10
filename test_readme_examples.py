@@ -294,5 +294,54 @@ ck("findOrEmpty", lambda: User.findOrEmpty(999999).id, None)
 ck("selectOrFail", lambda: len(User.selectOrFail()) >= 6, True)
 ck("withTrashed(软删模型)", lambda: len(SoftUser.withTrashed().select()) >= 1, True)
 
+# ---------- 查询缓存 / 流式读取 / 多线程（v0.4.0） ----------
+import threading
+
+Db.execute("CREATE TABLE IF NOT EXISTS cache_demo (id INTEGER PRIMARY KEY AUTOINCREMENT, url TEXT)")
+Db.execute("DELETE FROM cache_demo")
+Db.name("cache_demo").insert({"url": "https://example.com/a"})
+Db.clear_cache()
+
+ck("cache(秒) 首次查询",
+   lambda: Db.name("cache_demo").where({"url": "https://example.com/a"}).cache(10).find()["url"],
+   "https://example.com/a")
+Db.sql_log_clear()
+Db.name("cache_demo").where({"url": "https://example.com/a"}).cache(10).find()
+ck("cache(秒) 命中不产生 SQL", lambda: len(Db.get_sql_log()), 0)
+Db.name("cache_demo").where({"url": "https://example.com/a"}).update({"url": "https://example.com/b"})
+Db.sql_log_clear()
+ck("写操作后缓存失效",
+   lambda: Db.name("cache_demo").where({"url": "https://example.com/b"}).cache(10).find()["url"],
+   "https://example.com/b")
+ck("cache(0) 不缓存", lambda: len(Db.name("cache_demo").cache(0).select()) >= 1, True)
+ck("自定义缓存键", lambda: Db.name("cache_demo").cache(60, "demo:key").count() >= 1, True)
+ck("旧签名 cache(key, expire) 兼容",
+   lambda: Db.name("cache_demo").cache("demo:legacy", 60).count() >= 1, True)
+ck("缓存统计 backend", lambda: Db.cache_store().stats()["backend"], "memory")
+ck("clear_cache 返回条数", lambda: isinstance(Db.clear_cache(), int), True)
+_row = Db.name("cache_demo").cache(30).select()[0]
+_row["url"] = "mutated"
+ck("缓存结果隔离", lambda: Db.name("cache_demo").cache(30).select()[0]["url"] != "mutated", True)
+
+# 流式读取
+ck("chunk 分块大小", lambda: [len(b) for b in Db.name("user").order("id").chunk(2)][:2], [2, 2])
+ck("chunk 覆盖全部行", lambda: sum(len(b) for b in Db.name("user").chunk(3)), Db.name("user").count())
+ck("cursor 逐行读取", lambda: len(list(Db.name("user").order("id").cursor(chunk_size=2))), Db.name("user").count())
+ck("cursor 产出 dict", lambda: isinstance(next(iter(Db.name("user").cursor())), dict), True)
+
+# 多线程
+def _worker(n):
+    for i in range(5):
+        with Db.transaction():
+            Db.name("user").insert({"name": "thr%d-%d" % (n, i), "age": 1})
+
+_threads = [threading.Thread(target=_worker, args=(k,)) for k in range(3)]
+for _t in _threads:
+    _t.start()
+for _t in _threads:
+    _t.join()
+ck("多线程事务写入", lambda: Db.name("user").where_like("name", "thr%").count(), 15)
+ck("连接默认开启线程保护", lambda: Db.get_connection()._thread_safe, True)
+
 print("\nREADME 示例：通过 %d 项，失败 %d 项" % (ok, fail))
 sys.exit(1 if fail else 0)

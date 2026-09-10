@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import abc
 import re
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from ..config import Config
 from ..exceptions import OrmError
@@ -81,6 +81,18 @@ class Driver(abc.ABC):
     @abc.abstractmethod
     def insert(self, sql: str, params: Sequence[Any] = ()) -> int:
         """执行 INSERT，返回自增主键（不自动提交）。"""
+
+    def select_stream(self, sql: str, params: Sequence[Any] = (),
+                      chunk_size: int = 1000) -> Iterator[List[dict]]:
+        """流式执行 SELECT，按 ``chunk_size`` 分块产出 dict 列表。
+
+        默认实现为"整体查询后分块"，仅保证接口可用；具备游标能力的驱动
+        应覆写本方法（参照 ``SQLiteDriver.select_stream``）以实现真流式，
+        避免大结果集整体载入内存。
+        """
+        rows = self.select(sql, params)
+        for start in range(0, len(rows), chunk_size):
+            yield rows[start:start + chunk_size]
 
     # ------------------------------------------------------------------ #
     # 事务原语

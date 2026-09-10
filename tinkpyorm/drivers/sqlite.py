@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import sqlite3
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from ..config import Config, SQLITE_CONNECT_KEYS
 from ..exceptions import InvalidArgumentException
@@ -107,6 +107,23 @@ class SQLiteDriver(SQLDriver):
         lastrowid = cur.lastrowid
         cur.close()
         return lastrowid
+
+    def select_stream(self, sql: str, params: Sequence[Any] = (),
+                      chunk_size: int = 1000) -> Iterator[List[dict]]:
+        """真流式查询：按 ``chunk_size`` 使用 ``fetchmany`` 逐块取数。
+
+        相比 ``select()`` 的 ``fetchall()``，内存占用与结果集大小无关，
+        适合全表扫描 / 大批量导出。
+        """
+        cur = self.connect().execute(sql, tuple(params))
+        try:
+            while True:
+                batch = cur.fetchmany(chunk_size)
+                if not batch:
+                    break
+                yield [dict(r) for r in batch]
+        finally:
+            cur.close()
 
     # ------------------------------------------------------------------ #
     # 事务

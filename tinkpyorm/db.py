@@ -167,3 +167,23 @@ class Db:
                        name: Optional[str] = None) -> None:
         """开启 SQL 日志，最多保留 ``max_size`` 条（None 表示不限制）。"""
         cls.get_connection(name).sql_log_enable(max_size)
+
+    # ------------------------------------------------------------------ #
+    # 查询缓存
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def clear_cache(cls, prefix: Optional[str] = None) -> int:
+        """清空查询缓存，返回清除条数。
+
+        链式查询的写操作（insert / update / delete 等）会自动清除对应表的
+        缓存；但裸 SQL（``Db.execute('UPDATE ...')``）不会，此时需手动调用
+        本方法，避免读到过期结果。
+        """
+        from . import cache as _cache
+        return _cache.clear(prefix)
+
+    @classmethod
+    def cache_store(cls) -> Any:
+        """返回当前缓存后端（可替换为自定义实现，详见 ``tinkpyorm.cache``）。"""
+        from . import cache as _cache
+        return _cache.store()
