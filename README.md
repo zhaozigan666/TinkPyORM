@@ -19,7 +19,7 @@
 
 **本文件**：[简介](#简介) · [特性](#特性) · [零依赖](#零依赖) · [安装](#安装) · [快速开始](#快速开始) · [更新记录](#更新记录) · [致谢与灵感来源](#致谢与灵感来源) · [许可证](#许可证)
 
-**技术文档**：共 25 页，见 [文档导航](#文档导航)，或直接打开 [`wiki/Home.md`](wiki/Home.md)
+**技术文档**：共 25 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
 
 ---
 
@@ -142,7 +142,8 @@ User.destroy(user.id)                                  # 删除
 
 ## 文档导航
 
-技术细节按主题拆分在 [`wiki/`](wiki/Home.md) 目录下：
+技术细节按主题拆分在 [`wiki/`](wiki/Home.md) 目录下，并同步发布到
+[**GitHub Wiki**](https://github.com/zhaozigan666/TinkPyORM/wiki)（带侧边栏导航，在线阅读更方便）：
 
 **入门**
 
@@ -228,7 +229,9 @@ User.destroy(user.id)                                  # 删除
    主题拆分到 [`wiki/`](wiki/Home.md) 共 25 页，每页带「上一页 / 下一页 / 返回索引」
    导航。拆分经**多重集校验**：67 个代码块前后完全一致（零丢失、零改写），
    正文仅有的差异是目录改写与一处刻意修正的相对链接。设计文档仍在 `docs/`，
-   性能数据仍在 `PERFORMANCE.md`。
+   性能数据仍在 `PERFORMANCE.md`。技术文档另经 `scripts/sync_wiki.py` 发布到
+   [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)——自动改写链接
+   （页面名去扩展名、仓库内文件转绝对 URL）、按索引生成侧边栏，并做零丢失校验。
 ### v0.7.0
 
 **JSON 路径写入的操作列表入口**（一条语句内混合 `set` / `insert` / `remove` / `patch`）：
