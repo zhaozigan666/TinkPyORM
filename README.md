@@ -213,6 +213,14 @@ User.destroy(user.id)                                  # 删除
 - 新增 `test_collection.py`（59 项）；合计 394 项单元测试 + 174 项示例通过
 - 新增设计文档 `docs/collection.md` 与 `wiki/26-Collection文档集合.md`；wiki 同步发布至 GitHub Wiki
 
+### v0.8.0 测试扩展
+
+文档集合全覆盖测试（补盲区，不新增 API）。
+
+- 新增 `test_collection_coverage.py`（25 项）：语义不变性（promote 前后查询等价）/ 缓存失效 / 注入面 / 并发原子自增 / 持久化重启 / 事务回滚 / schema 校验矩阵 / 多表 DDL 脏环境
+- 新增 `scripts/perf_collection.py`：字段提升 + 索引的查询收益基准（5000 行实测约 27×）
+- 合计 **419 项单元测试 + 174 项示例**全部通过
+
 ### v0.7.1
 
 `type` 校验修复；文档重组并发布到 GitHub Wiki。
