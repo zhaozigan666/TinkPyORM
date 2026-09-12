@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from ..config import Config, SQLITE_CONNECT_KEYS
 from ..exceptions import InvalidArgumentException
-from .base import SQLDriver
+from .base import SQLDriver, json_path_literal
 
 #: 合法 journal_mode（对应 SQLite PRAGMA journal_mode）
 JOURNAL_MODES = {"DELETE", "TRUNCATE", "PERSIST", "MEMORY", "WAL", "OFF"}
@@ -158,3 +158,54 @@ class SQLiteDriver(SQLDriver):
     def table_fields(self, table: str) -> List[str]:
         rows = self.select(f"PRAGMA table_info({self.quote_identifier(table)})")
         return [r["name"] for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # JSON 能力（SQLite JSON1，3.38+ 默认内置；本项目按 3.53 实现）
+    # ------------------------------------------------------------------ #
+    # 参考实现说明（扩展其它数据库时对照覆写本组方法即可）：
+    #   MySQL    : JSON_EXTRACT(col, path) 同名同参，JSON_CONTAINS 参数顺序
+    #              为 (col, 待查找值, path)，JSON_LENGTH(col, path)
+    #   Postgres : col #> '{a,b}' / jsonb_array_length(col #> path)
+    supports_json = True
+
+    def json_extract(self, column_sql: str, path: Any) -> str:
+        """``json_extract(col, '$.a.b')``。
+
+        路径经 :func:`normalize_json_path` 校验后内联为字面量；
+        返回值为 SQLite 原生类型（数字/文本/null），比较运算可直接使用。
+        """
+        return f"json_extract({column_sql}, {json_path_literal(path)})"
+
+    def json_exists(self, column_sql: str, path: Any) -> str:
+        """路径存在性判断。
+
+        用 ``json_type`` 而非 ``json_extract IS NOT NULL``，因为后者无法
+        区分"路径不存在"与"路径值为 JSON null"。
+        """
+        return f"(json_type({column_sql}, {json_path_literal(path)}) IS NOT NULL)"
+
+    def json_contains(self, column_sql: str, path: Any,
+                      placeholder: str = "?") -> str:
+        """数组元素包含判断。
+
+        以表值函数 ``json_each`` 展开数组后逐元素比较，因此对
+        ``$.tags`` 这类路径可正确命中，且绑定参数由 Builder 提供::
+
+            EXISTS (SELECT 1 FROM json_each(col, '$.tags') WHERE value = ?)
+        """
+        return (f"(EXISTS (SELECT 1 FROM json_each({column_sql}, "
+                f"{json_path_literal(path)}) WHERE value = {placeholder}))")
+
+    def json_length(self, column_sql: str, path: Any) -> str:
+        """元素个数（数组与对象通用）。
+
+        用 ``json_each`` 计数而非 ``json_array_length``，以便同时支持
+        对象类型；路径不存在时结果为 0（与空数组无法区分）。
+        """
+        return (f"(SELECT count(*) FROM json_each({column_sql}, "
+                f"{json_path_literal(path)}))")
+
+    def json_type(self, column_sql: str, path: Any) -> str:
+        """JSON 类型名（``null``/``true``/``false``/``integer``/``real``/
+        ``text``/``array``/``object``）；路径不存在返回 SQL NULL。"""
+        return f"json_type({column_sql}, {json_path_literal(path)})"

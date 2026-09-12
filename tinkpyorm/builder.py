@@ -5,13 +5,15 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .connection import Connection
+from .drivers import UnsupportedOperation
 from .exceptions import QueryError
 from .utils import Raw, parse_field, parse_order, is_raw
 
-__all__ = ["Builder", "RawWhere"]
+__all__ = ["Builder", "RawWhere", "JsonWhere", "JSON_OPS"]
 
 # 支持的比较运算符
 _OPS = {
@@ -20,7 +22,68 @@ _OPS = {
     "is", "is not", "exists", "not exists", "find_in_set", "exp", "raw",
 }
 
+# JSON 路径条件支持的运算符（与 _OPS 分离，语义为"作用于 JSON 路径值"）
+JSON_OPS = {
+    "=", "!=", "<>", ">", "<", ">=", "<=",
+    "like", "not like", "in", "not in", "between", "not between",
+    "is null", "is not null", "null", "not null",
+    "exists", "not exists", "contains", "not contains",
+}
+
 _JOIN_TYPES = {"INNER", "LEFT", "RIGHT", "FULL", "CROSS"}
+
+
+class RawWhere:
+    """带参数绑定的原生 WHERE 片段（where_raw 使用）。
+
+    与 Raw 的区别：Raw 的值不绑定参数；RawWhere 支持 ``?`` 占位符
+    并携带对应参数。
+    """
+
+    __slots__ = ("sql", "params")
+
+    def __init__(self, sql: str, params: Sequence[Any] = ()):
+        self.sql = sql
+        self.params = list(params)
+
+
+class JsonWhere:
+    """JSON 路径条件（由 ``Query.where_json()`` 构造）。
+
+    独立于普通字段条件存在，是因为 JSON 条件的 SQL 形态由**驱动方言**
+    决定（SQLite 用 ``json_extract``，MySQL 用 ``JSON_EXTRACT``，
+    MongoDB 走原生查询），交给 Builder 在编译期向驱动取表达式，
+    从而避免把方言知识泄露到 Query 层。
+
+    参数说明：
+
+    - ``column``：JSON 列名
+    - ``path``：JSON 路径（``$.a.b`` / ``a.b`` / ``[0]``，见 normalize_json_path）
+    - ``op``：运算符（见 ``JSON_OPS``）
+    - ``value``：比较值，走参数绑定
+    - ``func``：左值取用哪个驱动函数 ——
+      ``None`` 为路径值提取（``json_extract``），
+      ``'length'`` 为元素个数（``json_length``），
+      ``'type'`` 为类型名（``json_type``）
+
+    参数 ``path`` 由驱动校验后内联（见 ``normalize_json_path``），
+    ``value`` 一律绑定参数。
+    """
+
+    __slots__ = ("column", "path", "op", "value", "func")
+
+    def __init__(self, column: str, path: Any = None,
+                 op: str = "=", value: Any = None,
+                 func: Optional[str] = None):
+        self.column = column
+        self.path = path
+        self.op = op
+        self.value = value
+        self.func = func
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return (f"JsonWhere({self.column!r}, {self.path!r}, "
+                f"{self.op!r}, {self.value!r}, func={self.func!r})")
 
 
 class RawWhere:
@@ -112,9 +175,11 @@ class Builder:
     def _build_field(self, options: dict) -> str:
         fields = options.get("field")
         without = options.get("without_field")
+        json_fields = options.get("json_field") or []
+
         if fields:
-            return ", ".join(parse_field(fields, self._qi))
-        if without:
+            base = ", ".join(parse_field(fields, self._qi))
+        elif without:
             # SQLite 不支持 SELECT * EXCEPT：基于表结构生成排除后的字段列表
             tables = options.get("table") or []
             if len(tables) != 1:
@@ -130,8 +195,22 @@ class Builder:
             keep = [f for f in all_fields if f not in exclude]
             if not keep:
                 raise QueryError("without_field 排除后无可用字段")
-            return ", ".join(self._qi(f) for f in keep)
-        return "*"
+            base = ", ".join(self._qi(f) for f in keep)
+        else:
+            base = "*"
+
+        # JSON 路径字段独立通道，编译期合并（不受 field() 覆盖影响）
+        if json_fields:
+            base = base + ", " + ", ".join(
+                self._json_field_expr(col, path, alias)
+                for (col, path, alias) in json_fields)
+        return base
+
+    def _json_field_expr(self, column: str, path: Any,
+                         alias: Optional[str]) -> str:
+        """把 JSON 路径字段编译为 ``json_extract(col, path) AS alias``。"""
+        expr = self.conn.driver.json_extract(self._qi(column), path)
+        return f"{expr} AS {self._qi(alias)}" if alias else expr
 
     # ------------------------------------------------------------------ #
     # WHERE
@@ -161,6 +240,8 @@ class Builder:
         return "WHERE " + " ".join(parts), params
 
     def _parse_cond(self, cond: Any) -> Tuple[str, list]:
+        if isinstance(cond, JsonWhere):
+            return self._build_json_condition(cond)
         if isinstance(cond, RawWhere):
             return cond.sql, list(cond.params)
         if is_raw(cond):
@@ -278,6 +359,118 @@ class Builder:
         if op == "not exists":
             return self._exists_sql("NOT EXISTS", value)
         raise QueryError(f"不支持的比较运算符: {op}")
+
+    # ------------------------------------------------------------------ #
+    # JSON 路径条件
+    # ------------------------------------------------------------------ #
+    def _build_json_condition(self, jw: JsonWhere) -> Tuple[str, list]:
+        """把 :class:`JsonWhere` 编译为方言级 SQL 与绑定参数。
+
+        语义约定（完整说明见 ``docs/json-query.md``）：
+
+        - ``is null`` / ``is not null``：路径**值**为 JSON null 或路径不存在
+        - ``exists`` / ``not exists``：路径**是否存在**（值为 null 也算存在）
+        - ``contains`` / ``not contains``：JSON 数组是否含某标量元素
+        - 其余运算符（``=`` / ``>`` / ``like`` / ``in`` / ``between`` …）
+          作用于路径提取出的值
+
+        SQL 形态由驱动提供（``json_extract`` / ``json_contains`` …），
+        本方法只负责运算符分派与参数绑定顺序。
+        """
+        driver = self.conn.driver
+        if not driver.supports_json:
+            raise UnsupportedOperation(
+                f"{driver.name} 驱动不支持 JSON 路径查询")
+
+        col = self._qi(jw.column)
+        path = jw.path
+        op = str(jw.op or "=").strip().lower()
+        if op not in JSON_OPS:
+            raise QueryError(
+                f"不支持的 JSON 条件运算符: {jw.op!r}。可选: "
+                + ", ".join(sorted(JSON_OPS)))
+
+        value = jw.value
+
+        # 1) 路径存在性
+        if op in ("exists", "not exists"):
+            expr = driver.json_exists(col, path)
+            return (expr, []) if op == "exists" else (f"NOT {expr}", [])
+
+        # 2) 值为 null / 非 null
+        if op in ("is null", "null"):
+            return f"{driver.json_extract(col, path)} IS NULL", []
+        if op in ("is not null", "not null"):
+            return f"{driver.json_extract(col, path)} IS NOT NULL", []
+
+        # 3) 数组元素包含
+        if op in ("contains", "not contains"):
+            expr = driver.json_contains(col, path, driver.placeholder(1))
+            if op == "contains":
+                return expr, [self._json_scalar(value)]
+            return f"NOT {expr}", [self._json_scalar(value)]
+
+        lhs = self._json_lhs(driver, col, path, jw.func)
+
+        # 4) 集合运算
+        if op in ("in", "not in"):
+            if not isinstance(value, (list, tuple, set)):
+                raise QueryError("JSON in 条件需要序列值（list/tuple/set）")
+            values = list(value)
+            if not values:
+                return ("1 = 0" if op == "in" else "1 = 1"), []
+            marks = driver.placeholder(len(values))
+            return (f"{lhs} IN ({marks})",
+                    [self._json_scalar(v) for v in values])
+
+        if op in ("between", "not between"):
+            if not isinstance(value, (list, tuple)) or len(value) != 2:
+                raise QueryError("JSON between 条件需要 [下限, 上限] 两个值")
+            keyword = "BETWEEN" if op == "between" else "NOT BETWEEN"
+            return (f"{lhs} {keyword} ? AND ?",
+                    [self._json_scalar(value[0]), self._json_scalar(value[1])])
+
+        # 5) 模糊匹配与标量比较
+        if op in ("like", "not like"):
+            keyword = "LIKE" if op == "like" else "NOT LIKE"
+            return f"{lhs} {keyword} ?", [value]
+
+        sql_op = "<>" if op == "<>" else op.upper()
+        return f"{lhs} {sql_op} ?", [self._json_scalar(value)]
+
+    @staticmethod
+    def _json_lhs(driver: Any, column_sql: str, path: Any,
+                  func: Optional[str]) -> str:
+        """按 ``func`` 取 JSON 条件的左值表达式。
+
+        - ``None`` ：路径值（``json_extract``）
+        - ``length``：元素个数（``json_length``）
+        - ``type``  ：类型名（``json_type``）
+        """
+        if func == "length":
+            return driver.json_length(column_sql, path)
+        if func == "type":
+            return driver.json_type(column_sql, path)
+        return driver.json_extract(column_sql, path)
+
+    @staticmethod
+    def _json_scalar(value: Any) -> Any:
+        """转换 JSON 条件的绑定值。
+
+        SQLite / MySQL 的 JSON 布尔以整数 0/1 存储，故 ``True``/``False``
+        转为 1/0，否则与 ``json_extract`` 的结果无法比较。
+
+        ``dict`` / ``list`` 不支持直接比较：JSON 文本比较受键顺序与空白
+        格式影响，结果不可靠，因此显式报错并引导到正确 API。
+        """
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (dict, list)):
+            raise QueryError(
+                "JSON 条件不支持 dict/list 直接比较（JSON 文本比较受键序与"
+                "格式影响，结果不可靠）：数组元素匹配请用 where_json_contains()，"
+                "复杂结构匹配请用 where_raw() 配合 json_extract()")
+        return value
 
     def _exists_sql(self, keyword: str, value: Any) -> Tuple[str, list]:
         if is_raw(value):
@@ -407,7 +600,8 @@ class Builder:
         marks = self.conn.driver.placeholder(len(fields))
         cols = ", ".join(self.conn.driver.quote_identifier(f) for f in fields)
         sql = f"INSERT INTO {table} ({cols}) VALUES ({marks})"
-        return sql, [data[f] for f in fields]
+        # dict / list 值自动编码为 JSON 文本（驱动层 json_encode 负责方言差异）
+        return sql, [self.conn.driver.json_encode(data[f]) for f in fields]
 
     def insert_all(self, options: dict, data_list: List[dict]) -> Tuple[str, list]:
         table = self._build_table(options)
@@ -422,7 +616,7 @@ class Builder:
         rows_sql, params = [], []
         for row in data_list:
             rows_sql.append("(" + self.conn.driver.placeholder(len(fields)) + ")")
-            params.extend(row[f] for f in fields)
+            params.extend(self.conn.driver.json_encode(row[f]) for f in fields)
         sql = f"INSERT INTO {table} ({cols}) VALUES {', '.join(rows_sql)}"
         return sql, params
 
@@ -434,7 +628,7 @@ class Builder:
                 set_sql.append(f"{self._qi(field)} = {value.value}")
             else:
                 set_sql.append(f"{self._qi(field)} = ?")
-                set_params.append(value)
+                set_params.append(self.conn.driver.json_encode(value))
         where_sql, where_params = self.build_where(options.get("where", []))
         if not where_sql:
             raise QueryError("update 必须指定 where 条件（防止全表更新）")

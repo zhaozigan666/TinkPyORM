@@ -343,5 +343,86 @@ for _t in _threads:
 ck("多线程事务写入", lambda: Db.name("user").where_like("name", "thr%").count(), 15)
 ck("连接默认开启线程保护", lambda: Db.get_connection()._thread_safe, True)
 
+# ---------- JSON 字段查询 ----------
+Db.execute("CREATE TABLE IF NOT EXISTS jdoc ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, extra TEXT)")
+Db.name("jdoc").insert_all([
+    {"name": "张三", "extra": {"age": 18, "city": "北京",
+                               "tags": ["vip", "new"], "note": None}},
+    {"name": "李四", "extra": {"age": 25, "city": "上海", "score": 92.0,
+                               "tags": ["new"]}},
+])
+
+ck("JSON 写入自动序列化",
+   lambda: isinstance(Db.query("SELECT extra FROM jdoc WHERE name = ?", ["张三"])[0]["extra"], str),
+   True)
+ck("json() 结果自动格式化为 dict",
+   lambda: isinstance(Db.name("jdoc").json().where("name", "张三").find()["extra"], dict),
+   True)
+ck("json([...]) 指定字段",
+   lambda: Db.name("jdoc").json(["extra"]).where("name", "李四").find()["extra"]["city"],
+   "上海")
+ck("json(False) 关闭解码",
+   lambda: isinstance(Db.name("jdoc").json(False).where("name", "张三").find()["extra"], str),
+   True)
+ck("json() 覆盖 value/column 路径",
+   lambda: Db.name("jdoc").json(["extra"]).where("name", "李四").value("extra")["score"],
+   92.0)
+ck("json() 覆盖 chunk 路径",
+   lambda: all(isinstance(r["extra"], dict) for r in next(iter(Db.name("jdoc").json().chunk(2)))),
+   True)
+ck("where_json 数值比较",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json("extra", "$.age", ">", 18).select()],
+   ["李四"])
+ck("where_json 简写等值",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json("extra", "$.city", "北京").select()],
+   ["张三"])
+ck("where_json 路径省略 $ 前缀",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json("extra", "age", 25).select()],
+   ["李四"])
+ck("where_json_contains",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json_contains("extra", "$.tags", "vip").select()],
+   ["张三"])
+ck("where_json_exists（值 null 也算存在）",
+   lambda: len(Db.name("jdoc").where_json_exists("extra", "$.note").select()), 1)
+ck("where_json_not_exists",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json_not_exists("extra", "$.note").select()],
+   ["李四"])
+ck("where_json_length",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json_length("extra", "$.tags", ">=", 2).select()],
+   ["张三"])
+ck("where_json_type",
+   lambda: len(Db.name("jdoc").where_json_type("extra", "$.tags", "array").select()), 2)
+ck("where_json_type 值为 null",
+   lambda: [r["name"] for r in Db.name("jdoc").where_json_type("extra", "$.note", "null").select()],
+   ["张三"])
+ck("field_json 自动别名",
+   lambda: [r["city"] for r in Db.name("jdoc").field_json("extra", "$.city").select()],
+   ["北京", "上海"])
+ck("field_json 与 field 顺序无关",
+   lambda: set(Db.name("jdoc").field_json("extra", "$.city").field("name").select()[0].keys()),
+   {"name", "city"})
+ck("field_json 结果自动解码",
+   lambda: Db.name("jdoc").field_json("extra", "$.tags").select()[0]["tags"], ["vip", "new"])
+ck("order_json 排序",
+   lambda: [r["name"] for r in Db.name("jdoc").order_json("extra", "$.age", "desc").select()],
+   ["李四", "张三"])
+ck("update 自动序列化",
+   lambda: Db.name("jdoc").where("name", "张三").update({"extra": {"age": 19, "city": "北京"}})
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["age"], 19)
+
+
+class JDoc(Model):
+    __table__ = "jdoc"
+    __json__ = ["extra"]
+
+
+ck("模型 __json__ 自动接入",
+   lambda: isinstance(JDoc.where("name", "张三").find().extra, dict), True)
+ck("模型 to_dict 返回 dict",
+   lambda: isinstance(JDoc.where("name", "李四").find().to_dict()["extra"], dict), True)
+ck("模型配合 where_json 条件",
+   lambda: len(JDoc.where_json("extra", "$.city", "北京").select()), 1)
+
 print("\nREADME 示例：通过 %d 项，失败 %d 项" % (ok, fail))
 sys.exit(1 if fail else 0)

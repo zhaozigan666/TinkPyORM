@@ -26,7 +26,20 @@
         ...
     for row in Db.table("log").cursor():                   # 真流式，内存恒定
         ...
+
+JSON 查询与自动格式化（v0.5.0）::
+
+    Db.table("user").json().find(1)                        # 结果自动解析为 dict
+    Db.table("user").where_json("extra", "$.age", ">", 18).select()
+    Db.table("user").where_json_contains("extra", "$.tags", "vip").select()
+    Db.table("user").field_json("extra", "$.city", "city").select()
+    Db.table("user").order_json("extra", "$.score", "desc").select()
+
+写库时 ``dict`` / ``list`` 自动序列化为 JSON 文本，读库时自动还原为
+Python 对象；JSON 条件的 SQL 形态由驱动提供，可扩展至 MySQL / PostgreSQL
+（MongoDB / Redis 走原生对象，无需 SQL 层）。
 """
+from .builder import JsonWhere, JSON_OPS
 from .cache import CacheStore, MemoryCacheStore
 from .collection import Collection, Paginator
 from .connection import Connection
@@ -34,6 +47,7 @@ from .db import Db
 from .drivers import (
     Driver, SQLDriver, NoSQLDriver, SQLiteDriver,
     UnsupportedOperation, register_driver, get_driver, available_drivers,
+    normalize_json_path,
 )
 from .exceptions import (
     OrmError, QueryError, DataNotFound, ModelNotFound,
@@ -45,13 +59,14 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore",
+    "JsonWhere", "JSON_OPS", "normalize_json_path",
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "register_driver", "get_driver", "available_drivers", "UnsupportedOperation",
     "OrmError", "QueryError", "DataNotFound", "ModelNotFound",

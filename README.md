@@ -33,6 +33,7 @@
 - [模型](#模型)
 - [获取器与修改器](#获取器与修改器)
 - [类型转换](#类型转换)
+- [JSON 字段查询](#json-字段查询)
 - [软删除](#软删除)
 - [查询范围 Scope](#查询范围-scope)
 - [模型事件](#模型事件)
@@ -97,6 +98,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **嵌套事务** —— 基于 SAVEPOINT，内层回滚不影响外层
 - **结果集与分页** —— `Collection`（`column / where / map / sum / to_json` …）+ `Paginator`
 - **camelCase 别名** —— `whereIn` 自动映射到 `where_in`，PHP/JS 开发者上手无阻
+- **JSON 字段查询** —— `json()` 结果自动格式化为 Python `dict`；`where_json` 家族支持路径条件（比较 / 存在 / 包含 / 长度 / 类型），`field_json` / `order_json` 提取与排序，写入侧自动序列化；SQL 形态由驱动提供，可扩展至 MySQL / MongoDB / Redis
 - **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
@@ -646,6 +648,154 @@ class User(Model):
 
 ---
 
+## JSON 字段查询
+
+SQLite 自 3.38 起内置 JSON1 函数，TinkPyORM 在其上封装了"写入自动序列化 →
+路径条件查询 → 结果自动格式化"的完整闭环。开启方式只需一个 `json()`。
+
+### 写入：Python 对象自动序列化
+
+```python
+Db.table('user').insert({
+    'name': '张三',
+    'extra': {'age': 18, 'city': '北京', 'tags': ['vip', 'new']},
+})
+# 落库为：'{"age": 18, "city": "北京", "tags": ["vip", "new"]}'
+
+Db.table('user').where('id', 1).update({'extra': {'age': 19}})   # 同样生效
+Db.table('user').insert_all([{...}, {...}])                      # 批量同样生效
+```
+
+`dict` / `list` 值自动编码为 JSON 文本，无需手动 `json.dumps`；
+其余类型（含 `None`、数字、普通字符串）原样绑定，不受影响。
+
+### 读取：自动格式化为 Python dict
+
+```python
+Db.table('user').json().find(1)          # {'id': 1, 'extra': {'age': 18, ...}}
+Db.table('user').json(['extra']).select()  # 指定字段，零嗅探开销（推荐）
+Db.table('user').json(False).select()      # 显式关闭
+```
+
+| 写法 | 行为 |
+|---|---|
+| `json()` / `json(True)` | 自动嗅探：字形如 JSON 的字符串字段一律解码 |
+| `json(['extra', 'meta'])` | 只解码指定字段（推荐生产环境使用） |
+| `json(False)` | 关闭解码（便于链式切换） |
+
+解码结果同样是 `dict` 的路径覆盖 `find / select / value / column /
+chunk / cursor / paginate`，以及模型属性访问与 `to_dict()`。
+
+模型只需声明字段，查询时自动接入：
+
+```python
+class User(Model):
+    __table__ = 'user'
+    __json__ = ['extra']        # 或 __type__ = {'extra': 'json'}
+
+User.find(1).extra              # {'age': 18, 'city': '北京', ...}
+User.find(1).to_dict()['extra'] # dict，不是 JSON 文本
+```
+
+### 路径条件查询
+
+```python
+# 显式写法：字段 + 路径 + 运算符 + 值
+Db.table('user').where_json('extra', '$.age', '>', 18).select()
+Db.table('user').where_json('extra', '$.level', 'in', [2, 3]).select()
+Db.table('user').where_json('extra', '$.name', 'like', '%张%').select()
+Db.table('user').where_json('extra', '$.age', 'between', [18, 30]).select()
+
+# 简写：省略运算符时视为"等于"
+Db.table('user').where_json('extra', '$.city', '北京').select()
+Db.table('user').where_json('extra', '$.age', 18).select()
+Db.table('user').where_json('extra', '$.deleted', False).select()   # JSON 布尔
+Db.table('user').where_json('extra', '$.note', None).select()       # → IS NULL
+
+# OR 连接
+Db.table('user').where_json_or('extra', '$.city', '上海').select()
+```
+
+语义化方法：
+
+| 方法 | 语义 |
+|---|---|
+| `where_json_exists(f, p)` | 路径**存在**（值为 JSON `null` 也算存在） |
+| `where_json_not_exists(f, p)` | 路径不存在 |
+| `where_json_null(f, p)` | 路径值**为 null 或路径不存在** |
+| `where_json_not_null(f, p)` | 路径值非 null |
+| `where_json_contains(f, p, v)` | JSON 数组包含标量元素 `v` |
+| `where_json_not_contains(f, p, v)` | JSON 数组不包含 `v` |
+| `where_json_length(f, p, op, n)` | 数组 / 对象元素个数比较（`where_json_length(f, p, 3)` 即等于 3） |
+| `where_json_type(f, p, type)` | 路径值类型（`array` / `object` / `integer` / `text` / `null` / `true` …） |
+
+> `is null` 与 `exists` 的区别：JSON 中"键不存在"与"键值为 `null`"是两件事。
+> `json_extract` 对两者都返回 SQL NULL，所以 `is null` 会同时命中；
+> 需要严格判断键是否存在时用 `where_json_exists`。
+
+路径写法很宽松，`'$.user.name'`、`'user.name'`、`'[0].id'` 均可，
+统一归一化为 `$` 开头；支持嵌套、数组下标与带引号的键（`$."带空格的键"`）。
+
+### 选取与排序 JSON 路径
+
+```python
+# 选取路径值作为字段（别名按路径末段自动生成，结果自动解码）
+Db.table('user').field_json('extra', '$.city').select()
+# SELECT *, json_extract(`extra`, '$.city') AS `city` FROM `user`
+
+Db.table('user').field('name').field_json('extra', '$.city').select()
+# → [{'name': '张三', 'city': '北京'}, ...]
+
+# 按路径值排序
+Db.table('user').order_json('extra', '$.score', 'desc').select()
+```
+
+`field_json` 走独立通道，与 `field()` 的调用顺序无关（不会被覆盖）；
+生成的别名字段自动纳入解码列表，无需再调用 `json()`。
+
+### 安全性
+
+- **路径**：经白名单校验后才内联为 SQL 字面量，非法路径（`$.a' OR '1'='1`）
+  立即抛 `InvalidArgumentException`。
+- **列名 / 别名**：校验为合法标识符，杜绝 `field_json(..., 'x; DROP TABLE')`
+  这类拼接注入。
+- **值**：一律参数绑定，与其它条件查询同一套机制。
+
+### 多数据库扩展
+
+JSON 条件的 SQL 形态由**驱动**提供，Query / Builder 层不含任何方言知识。
+新增数据库只需继承对应基类并覆写 JSON 方法：
+
+| 能力 | SQLite（已实现） | MySQL（预留） | MongoDB / Redis（预留） |
+|---|---|---|---|
+| 能力开关 | `supports_json = True` | 同 SQLite | 同（`NoSQLDriver` 已内置） |
+| 路径取值 | `json_extract` | `JSON_EXTRACT` / `->>` | 原生 dict 查询 |
+| 路径存在 | `json_type(...) IS NOT NULL` | `JSON_CONTAINS_PATH` | 原生 |
+| 数组包含 | `json_each` + EXISTS | `JSON_CONTAINS` | 原生 |
+| 元素个数 | `json_each` 计数 | `JSON_LENGTH` | 原生 |
+| 类型判断 | `json_type` | `JSON_TYPE` | 原生 |
+| 值解码 | JSON 文本 → dict | 同 SQLite | **恒等透传**（已是 Python 对象） |
+
+MongoDB / Redis 走 `NoSQLDriver`，`json_decode` / `json_encode` 为恒等函数，
+因此上层"结果自动格式化为 dict"的代码路径**无需任何分支**即可复用。
+`supports_json = False` 的驱动调用 JSON API 会抛出 `UnsupportedOperation`，
+而不是静默生成错误 SQL。
+
+详见 [`docs/json-query.md`](docs/json-query.md)。
+
+### 注意事项
+
+1. **复合值不做相等比较**：`where_json('extra', '$.tags', '=', ['vip'])`
+   会抛 `QueryError`。JSON 文本比较受键顺序与空白格式影响，结果不可靠；
+   数组元素匹配请用 `where_json_contains`，复杂结构请用
+   `where_raw` 配合 `json_extract`。
+2. **自动嗅探的误判**：`json()` 无参会把形如 `'[1,2]'`、`'"text"'` 的普通
+   字符串一并解析。字段语义固定时请用 `json(['extra'])` 显式声明。
+3. **布尔映射**：Python `True` / `False` 与 JSON `true` / `false` 在 SQLite 中
+   以整数 1 / 0 存储，条件查询已自动转换，无需手动处理。
+
+---
+
 ## 软删除
 
 ```python
@@ -1103,6 +1253,7 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 | 表 | `table` `name` `alias` |
 | 字段 | `field` `field_raw` `without_field` `distinct` `json` `with_attr` `filter` |
 | 条件 | `where` `where_or` `where_xor` `where_null` `where_not_null` `where_in` `where_not_in` `where_like` `where_not_like` `where_between` `where_not_between` `where_column` `where_exists` `where_not_exists` `where_raw` |
+| JSON | `json([fields])` `where_json` `where_json_or` `where_json_null` `where_json_not_null` `where_json_exists` `where_json_not_exists` `where_json_contains` `where_json_not_contains` `where_json_length` `where_json_type` `field_json` `order_json` |
 | 连接 | `join` `left_join` `right_join` `inner_join` |
 | 组合 | `union` `union_all` |
 | 分组排序 | `group` `having` `having_or` `order` `order_raw` |
@@ -1200,18 +1351,21 @@ TinkPyORM/
 │   ├── cache.py          # 查询缓存（进程级 + TTL + LRU + 可替换后端）
 │   ├── drivers/          # 驱动抽象层（base / sqlite，可扩展多数据库方言）
 │   ├── connection.py     # 连接门面：查询/执行/事务(SAVEPOINT)/日志/线程锁
-│   ├── builder.py        # SQL 编译器：options → SQL（select/insert/update/delete）
-│   ├── query.py          # 查询构造器：全链式 + 预载入 + 结果处理 + 缓存/流式
+│   ├── builder.py        # SQL 编译器：options → SQL（含 JSON 路径条件编译）
+│   ├── query.py          # 查询构造器：全链式 + 预载入 + JSON 查询 + 缓存/流式
 │   ├── collection.py     # Collection 结果集 + Paginator 分页
 │   ├── relation.py       # 关联实现：4 种类型 + 批量预载入
 │   ├── model.py          # Model 基类 + MetaModel 元类（scope/camelCase/静态代理）
 │   └── db.py             # Db 门面：连接管理、入口、事务、日志、缓存
+├── docs/
+│   └── json-query.md           # JSON 查询设计 + 多数据库扩展映射
 ├── test_tinkpyorm.py           # 核心测试（33 项）
 ├── test_drivers.py             # 驱动抽象层测试（9 项）
 ├── test_cache.py               # 查询缓存测试（24 项）
 ├── test_stream_concurrency.py  # 流式读取与并发测试（21 项）
+├── test_json.py                # JSON 查询与自动格式化测试（78 项）
 ├── smoke_test.py               # 端到端冒烟测试
-├── test_readme_examples.py     # README 示例回归测试（127 项）
+├── test_readme_examples.py     # README 示例回归测试（150 项）
 ├── benchmark_vs_sqlite3.py     # 与原生 sqlite3 的性能对照基准
 ├── PERFORMANCE.md              # 性能报告与优化记录
 └── README.md
@@ -1231,11 +1385,42 @@ TinkPyORM/
 8. **`lock()` 在 SQLite 下无实际效果**（SQLite 是文件级锁，`FOR UPDATE` 不适用），保留方法仅为 API 对齐。
 9. **获取器不改变存储值**：它只在读取时转换，查询条件里仍应使用数据库里的原始值。
 10. **模型属性访问未加载字段返回 `None`**，而非抛 `AttributeError`，这是刻意为之（避免模板里频繁判空）。
-11. **未实现的 think-orm 特性**：虚拟模型、实体模型/分层、视图模型、数据自动验证器、MongoDB 支持、分布式与断点重连。
+11. **JSON 能力需 SQLite ≥ 3.38**（JSON1 内置版本；本项目在 3.53 上开发验证）。更早的版本需编译时启用 JSON1 扩展。JSON 路径查询如需高性能，请建表达式索引（详见 `PERFORMANCE.md` 第十一节）。
+12. **JSON 复合值不支持相等比较**：`where_json(f, p, '=', [1,2])` 会抛 `QueryError`（JSON 文本比较受键序与空白影响，结果不可靠），请改用 `where_json_contains` 或 `where_raw`。
+13. **未实现的 think-orm 特性**：虚拟模型、实体模型/分层、视图模型、数据自动验证器、MongoDB 支持、分布式与断点重连。
 
 ---
 
 ## 更新记录
+
+### v0.5.0
+
+**JSON 字段查询与自动格式化**（写入自动序列化 → 路径条件查询 → 结果自动解码闭环）：
+
+1. **驱动层 JSON 能力契约** —— `Driver` 新增 `supports_json` 与 `json_extract` /
+   `json_exists` / `json_contains` / `json_length` / `json_type` / `json_decode` /
+   `json_encode` 七个扩展点；`SQLiteDriver` 给出完整参考实现（`json_extract` /
+   `json_each` / `json_type`）；`NoSQLDriver` 覆写编解码为**恒等透传**，
+   使 MongoDB / Redis 复用同一条"结果格式化为 dict"的代码路径。
+   路径经 `normalize_json_path()` 白名单校验后内联，杜绝路径注入。
+2. **写入自动序列化** —— `insert` / `insert_all` / `update` 遇 `dict` / `list` 值
+   自动编码为 JSON 文本（走驱动 `json_encode`，保持方言无关），
+   不再需要手动 `json.dumps`。
+3. **结果自动格式化** —— `json()` 支持三档：无参自动嗅探、`json([...])` 指定字段
+   （零嗅探开销）、`json(False)` 关闭；覆盖 `find / select / value / column /
+   chunk / cursor / paginate` 与模型属性；模型声明 `__json__` 后查询自动接入，
+   `_deserialize` 对已解码的 dict / list 幂等返回。
+4. **JSON 路径条件** —— 新增 `where_json` / `where_json_or` / `where_json_null` /
+   `where_json_not_null` / `where_json_exists` / `where_json_not_exists` /
+   `where_json_contains` / `where_json_not_contains` / `where_json_length` /
+   `where_json_type`，以及 `field_json` / `order_json`。新增 `JsonWhere` 条件对象，
+   由 Builder 在编译期向驱动取方言表达式，Query 层不含任何方言知识。
+5. **安全与边界** —— 路径、列名、别名三重白名单校验（`InvalidArgumentException`）；
+   `dict` / `list` 直接比较显式报错并引导到正确 API；不支持的驱动抛
+   `UnsupportedOperation` 而非静默生成错误 SQL。
+6. **测试与文档** —— 新增 `test_json.py`（78 项），合计 292 项测试全量通过；
+   README 新增「JSON 字段查询」章节，新增 `docs/json-query.md`（设计说明 +
+   MySQL / PostgreSQL / MongoDB / Redis 扩展映射）。
 
 ### v0.4.0
 

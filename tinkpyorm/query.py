@@ -3,19 +3,34 @@
 核心设计复刻 think-orm：所有链式方法修改内部 ``options`` 字典，
 终端方法将 options 交给 Builder 编译为 SQL 并执行。所有查询值
 一律参数绑定，杜绝 SQL 注入。
+
+JSON 能力（v0.5.0）：``where_json`` 家族提供 JSON 路径条件查询，
+``json()`` 控制结果的自动格式化（解析为 Python dict / list），
+底层 SQL 形态由驱动方言提供，可扩展至 MySQL / PostgreSQL 等。
 """
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import cache as _cache
-from .builder import Builder, RawWhere
+from .builder import Builder, JsonWhere, JSON_OPS, RawWhere
 from .connection import Connection
+from .drivers import UnsupportedOperation, normalize_json_path
 from .exceptions import DataNotFound, InvalidArgumentException, QueryError
 from .utils import Raw, raw, to_snake
 
 # SQLite 单语句绑定变量上限（SQLITE_MAX_VARIABLE_NUMBER）
 MAX_SQL_VARIABLES = 32766
+
+# JSON API 的列名/别名白名单：裸标识符，可带一层限定名（表.列）
+# 校验先于引用，避免非法名被 quote_identifier 当作"表达式原样返回"而注入
+_JSON_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
+_JSON_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+#: 参数未显式传入的哨兵（用于区分"省略运算符"与"传了 None"）
+_UNSET = object()
 
 
 class Query:
@@ -36,6 +51,7 @@ class Query:
             "table": [],        # [{'name':..., 'alias':...}, ...]
             "where": [],        # [(logic, cond), ...]
             "field": None,
+            "json_field": [],   # JSON 路径字段 [(列, 路径, 别名), ...]，由 Builder 合并
             "without_field": None,
             "order": None,
             "limit": None,
@@ -48,7 +64,7 @@ class Query:
             "comment": None,
             "alias": None,
             "data": None,       # insert/update 数据
-            "json": [],         # JSON 字段（查询时自动解码）
+            "json": [],         # JSON 解码字段：[] 关闭 / [field,...] 指定 / True 自动嗅探
             "attr": {},         # withAttr 获取器 {field: callable}
             "filter": [],       # filter 回调列表
             "fetch_sql": False,
@@ -301,10 +317,291 @@ class Query:
     # ------------------------------------------------------------------ #
     # 查询选项（结果处理）
     # ------------------------------------------------------------------ #
-    def json(self, fields: Sequence[str]) -> "Query":
-        """指定查询结果自动 JSON 解码的字段。"""
-        self.options["json"] = list(fields) if isinstance(fields, (list, tuple)) else [fields]
+    def json(self, fields: Union[None, bool, str, Sequence[str]] = None) -> "Query":
+        """启用 JSON 字段自动解码（查询结果格式化为 Python 对象）。
+
+        三种模式::
+
+            q.json()                     # 自动嗅探：字形如 JSON 的字符串字段一律解码
+            q.json(['extra', 'meta'])    # 指定字段（零嗅探开销，推荐生产使用）
+            q.json(False)                # 关闭（显式声明，便于链式切换）
+
+        解码由驱动完成（``driver.json_decode``）：
+
+        - SQLite / MySQL：JSON 文本 -> dict / list / 标量
+        - MongoDB / Redis：原生返回 Python 对象，恒等透传，代码路径完全一致
+
+        解码是**幂等**的，且对 ``None`` 直接跳过；已解析的 dict / list 不会
+        被二次处理。缓存命中时同样会重新应用本设置，行为与未命中一致。
+        """
+        if fields is None or fields is True:
+            self.options["json"] = True
+        elif fields is False:
+            self.options["json"] = []
+        elif isinstance(fields, str):
+            self.options["json"] = [fields]
+        else:
+            self.options["json"] = list(fields)
         return self
+
+    # ------------------------------------------------------------------ #
+    # JSON 路径条件查询（v0.5.0）
+    # ------------------------------------------------------------------ #
+    def where_json(self, field: str, path: Any = None,
+                   op: Any = "=", value: Any = _UNSET) -> "Query":
+        """JSON 路径条件（AND 连接）。
+
+        路径写法：``'$.user.name'`` / ``'user.name'`` / ``'[0].id'``，
+        统一归一化为 ``$`` 开头。支持两种调用签名::
+
+            # 4 参：字段 + 路径 + 运算符 + 值
+            Db.table('user').where_json('extra', '$.age', '>', 18).select()
+            Db.table('user').where_json('extra', '$.tags', 'contains', 'vip')
+            Db.table('user').where_json('extra', '$.name', 'like', '%张%')
+            Db.table('user').where_json('extra', '$.level', 'in', [2, 3])
+
+            # 3 参：省略运算符时视为"等于"（字符串值亦可）
+            Db.table('user').where_json('extra', '$.name', '张三')      # = 张三
+            Db.table('user').where_json('extra', '$.age', 18)          # = 18
+            Db.table('user').where_json('extra', '$.flag', True)       # = true
+            Db.table('user').where_json('extra', '$.deleted', 'exists')
+            Db.table('user').where_json('extra', '$.del_time', 'is null')
+
+        语义约定：
+
+        - ``value is None`` 且运算符为 ``=`` 时自动转 ``is null``
+          （``!=`` 转 ``is not null``），贴合直觉
+        - ``is null`` / ``is not null``：路径**值**为 null 或路径不存在
+        - ``exists`` / ``not exists``：路径**是否存在**（值为 null 也算存在）
+        - ``contains`` / ``not contains``：JSON 数组是否含某标量元素
+        - ``True`` / ``False`` 自动映射为 JSON 的 ``true`` / ``false``（存为 1/0）
+        - ``dict`` / ``list`` 不支持直接比较（文本比较受键序影响，结果不可靠），
+          会显式报错并引导到 ``where_json_contains`` / ``where_raw``
+
+        若第 3 个位置参数恰好等于某运算符名（如字符串 ``'in'``），会被优先
+        解释为运算符；需要比较该字符串值时请写全 4 个参数。
+        """
+        return self._json_where("AND", field, path, op, value)
+
+    def where_json_or(self, field: str, path: Any = None,
+                      op: Any = "=", value: Any = _UNSET) -> "Query":
+        """JSON 路径条件（OR 连接），签名与 :meth:`where_json` 相同。"""
+        return self._json_where("OR", field, path, op, value)
+
+    def where_json_null(self, field: str, path: Any = None) -> "Query":
+        """JSON 路径值为 null 或路径不存在。"""
+        return self._json_where("AND", field, path, "is null", None)
+
+    def where_json_not_null(self, field: str, path: Any = None) -> "Query":
+        """JSON 路径值非 null。"""
+        return self._json_where("AND", field, path, "is not null", None)
+
+    def where_json_exists(self, field: str, path: Any = None) -> "Query":
+        """JSON 路径存在（值为 ``null`` 亦算存在）。"""
+        return self._json_where("AND", field, path, "exists", None)
+
+    def where_json_not_exists(self, field: str, path: Any = None) -> "Query":
+        """JSON 路径不存在。"""
+        return self._json_where("AND", field, path, "not exists", None)
+
+    def where_json_contains(self, field: str, path: Any, value: Any) -> "Query":
+        """JSON 数组包含某标量元素::
+
+            Db.table('user').where_json_contains('extra', '$.tags', 'vip').select()
+        """
+        return self._json_where("AND", field, path, "contains", value)
+
+    def where_json_not_contains(self, field: str, path: Any, value: Any) -> "Query":
+        """JSON 数组不包含某标量元素。"""
+        return self._json_where("AND", field, path, "not contains", value)
+
+    def where_json_length(self, field: str, path: Any,
+                          op: Any = _UNSET, value: Any = _UNSET) -> "Query":
+        """按 JSON 数组 / 对象的元素个数过滤::
+
+            q.where_json_length('extra', '$.tags', '>=', 3)
+            q.where_json_length('extra', '$.tags', 5)      # 省略运算符 = 等于 5
+
+        路径不存在时长度为 0（与空数组不可区分）。
+        """
+        self._require_json()
+        field = self._json_ident(field, "where_json_length 的列名")
+        if op is _UNSET:
+            raise QueryError(
+                "where_json_length 需要运算符或数值，"
+                "例如 where_json_length('extra', '$.tags', '>=', 3)")
+        if value is _UNSET:
+            # 3 参形式：第 3 个位置参数是数值，默认等值比较
+            value, op = op, "="
+        elif not (isinstance(op, str) and op.strip().lower() in JSON_OPS):
+            raise QueryError(
+                f"不支持的 JSON 条件运算符: {op!r}。可选: "
+                + ", ".join(sorted(JSON_OPS)))
+        self.options["where"].append(
+            ("AND", JsonWhere(field, path, op, value, func="length")))
+        return self
+
+    def where_json_type(self, field: str, path: Any, type_name: str) -> "Query":
+        """按 JSON 路径值的类型过滤::
+
+            q.where_json_type('extra', '$.tags', 'array')
+            q.where_json_type('extra', '$.user', 'object')
+            q.where_json_type('extra', '$.deleted', 'null')
+
+        类型名：``null`` / ``true`` / ``false`` / ``integer`` / ``real`` /
+        ``text`` / ``array`` / ``object``（SQLite 与 MySQL 命名一致）。
+        """
+        if not isinstance(type_name, str) or not type_name.strip():
+            raise InvalidArgumentException("where_json_type 需要类型名字符串")
+        self._require_json()
+        field = self._json_ident(field, "where_json_type 的列名")
+        self.options["where"].append(
+            ("AND", JsonWhere(field, path, "=", type_name.strip().lower(),
+                              func="type")))
+        return self
+
+    def field_json(self, field: str, path: Any = None,
+                   alias: Optional[str] = None) -> "Query":
+        """选取 JSON 路径值作为查询字段（结果自动解码为 Python 对象）::
+
+            Db.table('user').field_json('extra', '$.city').select()
+            # SELECT json_extract(`extra`, '$.city') AS `city` FROM `user`
+            # -> Collection([{'city': '北京'}, ...])
+
+            Db.table('user').field('name').field_json('extra', '$.city').select()
+            # -> Collection([{'name': '张三', 'city': '北京'}, ...])
+
+        实现要点：
+
+        - JSON 字段走独立通道（``options['json_field']``），在编译期与
+          ``field()`` 的结果合并，因此**不会被后续 field() 覆盖**，
+          调用顺序自由；
+        - ``alias`` 省略时按路径末段自动生成（``$.user.name`` -> ``name``，
+          ``$.tags[0]`` -> ``tags``），同名自动加序号；
+        - 生成的别名字段自动纳入 JSON 解码列表，无需再调用 ``json()``。
+        """
+        driver = self._require_json()
+        field = self._json_ident(field, "field_json 的列名")
+        if alias:
+            alias = self._json_alias(alias)
+        else:
+            alias = self._json_alias_for(field, path)
+        used = {a for (_, _, a) in self.options["json_field"]}
+        if alias in used:
+            i = 2
+            while f"{alias}_{i}" in used:
+                i += 1
+            alias = f"{alias}_{i}"
+        self.options["json_field"].append((field, path, alias))
+        self._add_json_field(alias)
+        return self
+
+    @staticmethod
+    def _json_alias_for(field: str, path: Any) -> str:
+        """按 JSON 路径最后一段键名生成字段别名。
+
+        取的是最后一个 ``.key`` / ``."key"`` 段，因此 ``$.tags[0]`` 也能
+        得到 ``tags``；末段不是合法标识符（如 ``$``、``$."a b"``）时
+        回退为列名，避免生成无法用作 SQL 别名的键。
+        """
+        norm = normalize_json_path(path)
+        segs = re.findall(r'\.([A-Za-z_][A-Za-z0-9_]*)|\.\s*"([^"]*)"', norm)
+        seg = (segs[-1][0] or segs[-1][1]) if segs else ""
+        if seg and _JSON_ALIAS_RE.match(seg):
+            return seg
+        return field
+
+    def order_json(self, field: str, path: Any = None,
+                   direction: str = "asc") -> "Query":
+        """按 JSON 路径值排序::
+
+            Db.table('user').order_json('extra', '$.score', 'desc').select()
+
+        对应 ``ORDER BY json_extract(`extra`, '$.score') DESC``；多次调用
+        为覆盖语义（与 :meth:`order_raw` 一致）。
+        """
+        driver = self._require_json()
+        field = self._json_ident(field, "order_json 的列名")
+        d = str(direction or "asc").strip().upper()
+        if d not in ("ASC", "DESC"):
+            raise InvalidArgumentException(
+                f"order_json 的排序方向只能是 ASC/DESC，收到 {direction!r}")
+        expr = driver.json_extract(driver.quote_identifier(field), path)
+        return self.order_raw(f"{expr} {d}")
+
+    # ---- JSON 条件内部实现 ---- #
+    def _json_where(self, logic: str, field: str, path: Any,
+                    op: Any, value: Any) -> "Query":
+        """JSON 条件统一入口：参数归一化后追加到 where 列表。
+
+        兼容两种签名（见 :meth:`where_json` 文档）：
+
+        - 显式传了 ``value``：``op`` 必须是合法运算符，否则报错，
+          避免拼写错误被静默当成"等于某字符串"
+        - 未传 ``value``（哨兵）：``op`` 是运算符时按运算符处理
+          （``exists`` / ``is null`` 等），否则视为比较值
+        """
+        self._require_json()
+        field = self._json_ident(field, "JSON 条件的列名")
+
+        if value is _UNSET:
+            if isinstance(op, str) and op.strip().lower() in JSON_OPS:
+                value = None
+            else:
+                value, op = op, "="
+        elif not (isinstance(op, str) and op.strip().lower() in JSON_OPS):
+            raise QueryError(
+                f"不支持的 JSON 条件运算符: {op!r}。可选: "
+                + ", ".join(sorted(JSON_OPS)))
+
+        op = str(op or "=").strip().lower()
+        # None 值自动转为 IS NULL / IS NOT NULL，贴合 SQL 直觉
+        if value is None:
+            if op == "=":
+                op = "is null"
+            elif op in ("!=", "<>"):
+                op = "is not null"
+        self.options["where"].append((logic, JsonWhere(field, path, op, value)))
+        return self
+
+    @staticmethod
+    def _json_ident(name: Any, what: str) -> str:
+        """校验列名/字段名为合法标识符（防注入的最后一道闸口）。"""
+        s = str(name).strip()
+        if not _JSON_IDENT_RE.match(s):
+            raise InvalidArgumentException(
+                f"{what} 必须是合法标识符（字母/数字/下划线，可含一层表限定），"
+                f"收到 {name!r}")
+        return s
+
+    @staticmethod
+    def _json_alias(alias: Any) -> str:
+        """校验输出别名，确保可安全用于 ``AS`` 与结果字典键。"""
+        s = str(alias).strip()
+        if not _JSON_ALIAS_RE.match(s):
+            raise InvalidArgumentException(
+                f"JSON 字段别名必须是合法标识符（字母/数字/下划线），"
+                f"收到 {alias!r}")
+        return s
+
+    def _require_json(self) -> Any:
+        """校验当前驱动是否支持 JSON 路径查询，返回驱动实例。"""
+        driver = self._resolve_conn().driver
+        if not getattr(driver, "supports_json", False):
+            raise UnsupportedOperation(
+                f"{driver.name} 驱动不支持 JSON 路径查询"
+                f"（supports_json=False）")
+        return driver
+
+    def _add_json_field(self, field: str) -> None:
+        """把字段登记到自动解码列表（自动模式下无需登记）。"""
+        spec = self.options["json"]
+        if spec is True:
+            return
+        if not spec:
+            self.options["json"] = [field]
+        elif isinstance(spec, list) and field not in spec:
+            spec.append(field)
 
     def with_attr(self, field: str, callback: Callable[[Any], Any]) -> "Query":
         """字段获取器（查询结果转换）。"""
@@ -852,15 +1149,20 @@ class Query:
         return _cache.clear(prefix)
 
     def _process_row(self, row: Any) -> dict:
-        """单行后处理：JSON 解码 -> 获取器（attr）-> filter 回调。"""
+        """单行后处理：JSON 解码 -> 获取器（attr）-> filter 回调。
+
+        JSON 解码交由驱动（``driver.json_decode``）：SQLite / MySQL 解析
+        JSON 文本，MongoDB / Redis 恒等透传。解码幂等，``None`` 直接跳过。
+        """
         item = dict(row)
-        for f in self.options["json"]:
-            if f in item and isinstance(item[f], str):
-                import json
-                try:
-                    item[f] = json.loads(item[f])
-                except (ValueError, TypeError):
-                    pass
+        spec = self.options["json"]
+        if spec:
+            decode = (self.conn.driver.json_decode if self.conn is not None
+                      else _plain_json_decode)
+            fields = list(item.keys()) if spec is True else spec
+            for f in fields:
+                if f in item and item[f] is not None:
+                    item[f] = decode(item[f])
         for f, cb in self.options["attr"].items():
             if f in item:
                 item[f] = cb(item[f])
@@ -915,6 +1217,23 @@ class Query:
                 tmp = Query(self.conn, model=type(related[0]))
                 tmp.options["with"] = [".".join(nested)]
                 tmp._eager_load(related)
+
+
+def _plain_json_decode(value: Any) -> Any:
+    """无连接上下文时的 JSON 解码兜底（正常路径走 driver.json_decode）。"""
+    if isinstance(value, (dict, list)):
+        return value
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            value = value.decode("utf-8")
+        except UnicodeDecodeError:
+            return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (ValueError, TypeError):
+            return value
+    return value
 
 
 def conn_render(sql: str, params: Sequence[Any]) -> str:

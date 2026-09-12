@@ -14,13 +14,17 @@ from importlib import import_module
 from typing import Dict, List, Optional, Type
 
 from ..exceptions import DriverNotAvailable
-from .base import Driver, NoSQLDriver, SQLDriver, UnsupportedOperation
+from .base import (
+    Driver, NoSQLDriver, SQLDriver, UnsupportedOperation,
+    JSON_ROOT, json_path_literal, normalize_json_path,
+)
 from .sqlite import SQLiteDriver
 
 __all__ = [
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "UnsupportedOperation", "register_driver", "get_driver",
-    "available_drivers",
+    "available_drivers", "normalize_json_path", "json_path_literal",
+    "JSON_ROOT",
 ]
 
 #: 已注册的驱动（驱动名 -> 驱动类）

@@ -257,6 +257,10 @@ class Model(metaclass=MetaModel):
             return None
         t = self.__type__.get(field)
         if t in ("json", "array") or field in self.__json__:
+            # 查询层（Query.json / 模型 __json__ 自动接入）可能已解码，
+            # 对 dict / list 幂等返回，避免二次 json.loads 报错或复制
+            if isinstance(value, (dict, list)):
+                return value
             try:
                 return json.loads(value)
             except (ValueError, TypeError):
@@ -319,6 +323,10 @@ class Model(metaclass=MetaModel):
         q.name(cls._table_name())   # name() 会自动补 __prefix__（前缀为空时等价 table()）
         if cls.__soft_delete__:
             q.options["soft_delete"] = cls.__soft_delete__
+        # __json__ 声明的字段：查询结果自动解码为 dict / list（v0.5.0），
+        # 使 User.find(1).extra 直接拿到 Python 对象而非 JSON 文本
+        if cls.__json__:
+            q.options["json"] = list(cls.__json__)
         return q
 
     @classmethod

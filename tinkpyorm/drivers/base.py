@@ -12,14 +12,69 @@
 from __future__ import annotations
 
 import abc
+import json
 import re
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from ..config import Config
-from ..exceptions import OrmError
+from ..exceptions import InvalidArgumentException, OrmError
 
 # 合法裸标识符（用于区分字段名 vs 表达式）：仅字母数字下划线，可含点
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# ---------------------------------------------------------------------- #
+# JSON 路径工具（方言无关，所有支持 JSON 的驱动共用）
+# ---------------------------------------------------------------------- #
+#: JSON 根路径
+JSON_ROOT = "$"
+
+#: 合法 JSON 路径：$ / $.key / $."key" / $[0] / $[#]，可任意组合
+_JSON_PATH_RE = re.compile(
+    r"^\$(?:"
+    r'\.(?:[A-Za-z_][A-Za-z0-9_]*|"[^"]*")'
+    r"|\[\d+\]"
+    r"|\[#\]"
+    r")*$"
+)
+
+
+def normalize_json_path(path: Any) -> str:
+    """把各种 JSON 路径写法统一为 ``$`` 开头的标准路径。
+
+    接受并归一化以下写法::
+
+        normalize_json_path(None)        -> '$'
+        normalize_json_path('')          -> '$'
+        normalize_json_path('$')         -> '$'
+        normalize_json_path('user.name') -> '$.user.name'
+        normalize_json_path('.user')     -> '$.user'
+        normalize_json_path('[0].id')    -> '$[0].id'
+
+    路径不合法时抛 :class:`InvalidArgumentException`，避免把任意字符串
+    拼进 SQL（本函数是 JSON 路径进入 SQL 前的唯一安全闸口）。
+    """
+    if path is None:
+        return JSON_ROOT
+    s = str(path).strip()
+    if not s or s == JSON_ROOT:
+        return JSON_ROOT
+    if not s.startswith("$"):
+        s = "$" + (s if s.startswith("[") else "." + s.lstrip("."))
+    if not _JSON_PATH_RE.match(s):
+        raise InvalidArgumentException(
+            f"非法 JSON 路径: {path!r}。合法形式示例: '$'、'user.name'、"
+            f"'$.items[0]'、'$.\"带空格的键\"'")
+    return s
+
+
+def json_path_literal(path: Any) -> str:
+    """把 JSON 路径渲染为 SQL 字符串字面量（含引号转义）。
+
+    路径经 :func:`normalize_json_path` 白名单校验后才会内联；
+    SQLite / MySQL 的 ``json_extract`` 家族要求路径是字面量或绑定值，
+    此处采用"校验 + 内联"以保证 SQL 结构可读且无注入风险。
+    """
+    return "'" + normalize_json_path(path).replace("'", "''") + "'"
 
 
 class UnsupportedOperation(OrmError, NotImplementedError):
@@ -165,6 +220,95 @@ class Driver(abc.ABC):
     def table_fields(self, table: str) -> List[str]:
         raise UnsupportedOperation(f"{self.name} 驱动未实现 table_fields()")
 
+    # ------------------------------------------------------------------ #
+    # JSON 能力（可选）
+    # ------------------------------------------------------------------ #
+    #: 是否支持 JSON 字段的路径查询。
+    #:
+    #: - SQLite / MySQL / PostgreSQL：True（实现下方方法即可）
+    #: - MongoDB / Redis 等 NoSQL：查询走原生客户端，本组方法不适用
+    #:   （``NoSQLDriver`` 已覆写为"原样返回 Python 对象"语义）
+    supports_json: bool = False
+
+    # 下述方法返回**方言级 SQL 表达式片段**，参数一律由 Builder 通过
+    # ``placeholder`` 提供的占位符绑定，驱动不得自行内联用户数据。
+    #
+    # 扩展新数据库时只需覆写本组方法（参照 SQLiteDriver）：
+    #   MySQL   : JSON_EXTRACT(col, path) / JSON_CONTAINS / JSON_LENGTH
+    #   Postgres: col #> path / col @> value::jsonb / jsonb_array_length
+    #   MongoDB : 由 NoSQLDriver 承接，走原生 dict 查询，不产生 SQL
+    def json_extract(self, column_sql: str, path: Any) -> str:
+        """返回"提取 JSON 路径值"的 SQL 表达式。"""
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 路径查询（supports_json=False）")
+
+    def json_exists(self, column_sql: str, path: Any) -> str:
+        """返回"JSON 路径是否存在"的布尔表达式。
+
+        语义为**路径存在**，与"路径值是否为 JSON null"区分：
+        路径存在但值为 ``null`` 时本表达式仍为真。
+        """
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 路径存在判断")
+
+    def json_contains(self, column_sql: str, path: Any,
+                      placeholder: str = "?") -> str:
+        """返回"JSON 数组是否包含某个标量元素"的布尔表达式。"""
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 数组包含判断")
+
+    def json_length(self, column_sql: str, path: Any) -> str:
+        """返回 JSON 数组 / 对象的元素个数表达式。"""
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 长度计算")
+
+    def json_type(self, column_sql: str, path: Any) -> str:
+        """返回 JSON 路径值的类型名表达式。
+
+        SQLite / MySQL 返回 ``'null'`` / ``'true'`` / ``'false'`` /
+        ``'integer'`` / ``'real'`` / ``'text'`` / ``'array'`` / ``'object'``。
+        """
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 类型判断")
+
+    # ---- 值编解码（Python 层，与方言无关，通常无需覆写） ---- #
+    def json_decode(self, value: Any) -> Any:
+        """把数据库返回的 JSON 值解码为 Python 对象（dict / list / 标量）。
+
+        默认实现：``str`` / ``bytes`` 尝试 ``json.loads``，失败则原样返回；
+        已经是 ``dict`` / ``list`` 的值直接返回（幂等）。
+
+        MongoDB / Redis 等原生返回 Python 对象的驱动应覆写为恒等函数，
+        避免把普通字符串误解析为 JSON。
+        """
+        if isinstance(value, (bytes, bytearray)):
+            try:
+                value = value.decode("utf-8")
+            except UnicodeDecodeError:
+                return value
+        if isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, str):
+            s = value.strip()
+            if len(s) < 2 or s[0] not in "[{\"" or s[-1] not in "]}\"":
+                # 快速排除：JSON 文档/字符串必以 { [ " 开头并以 } ] " 结尾
+                return value
+            try:
+                return json.loads(s)
+            except (ValueError, TypeError):
+                return value
+        return value
+
+    def json_encode(self, value: Any) -> Any:
+        """把 Python 对象编码为可绑定参数。
+
+        ``dict`` / ``list`` -> JSON 文本；其余值原样返回（交由底层驱动
+        绑定）。``tuple`` / ``set`` 不在此处转换，避免破坏既有语义。
+        """
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        return value
+
     def render_sql(self, sql: str, params: Sequence[Any]) -> str:
         """把参数内联进 SQL，仅供日志/调试展示（非执行路径）。"""
         out: List[str] = []
@@ -211,9 +355,22 @@ class NoSQLDriver(Driver):
     仅提供连接管理；SQL 相关能力一律抛 :class:`UnsupportedOperation`，
     避免产生"能构造 SQL 但语义错误"的假支持。使用者应通过
     ``raw_connection`` 访问原生客户端（如 ``redis.Redis``）。
+
+    JSON 语义：MongoDB / Redis 返回的对象本身已是 Python ``dict`` / ``list``，
+    因此 :meth:`json_decode` / :meth:`json_encode` 为恒等函数——
+    上层"结果自动格式化为 dict"的代码路径无需任何分支即可复用。
     """
 
     supports_transactions = False
+    supports_json = True
+
+    def json_decode(self, value: Any) -> Any:
+        """NoSQL 返回值已是 Python 对象，原样透传（不做字符串解析）。"""
+        return value
+
+    def json_encode(self, value: Any) -> Any:
+        """NoSQL 客户端直接接受 Python 对象，原样透传。"""
+        return value
 
     def select(self, sql: str, params: Sequence[Any] = ()) -> List[dict]:
         raise UnsupportedOperation(
