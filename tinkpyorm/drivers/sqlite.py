@@ -209,3 +209,91 @@ class SQLiteDriver(SQLDriver):
         """JSON 类型名（``null``/``true``/``false``/``integer``/``real``/
         ``text``/``array``/``object``）；路径不存在返回 SQL NULL。"""
         return f"json_type({column_sql}, {json_path_literal(path)})"
+
+    # ------------------------------------------------------------------ #
+    # JSON 路径写入（局部更新，JSON1 提供）
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _json_base(column_sql: str, ifnull: Any) -> str:
+        """构造"空列兜底"后的基表达式。
+
+        ``json_set(NULL, ...)`` 在 SQLite 中返回 NULL——即对尚未写入过
+        JSON 的列做路径更新会**静默无效**。显式传入空文档时以 ``COALESCE``
+        兜底；空文档是驱动常量字面量（``'{}'`` / ``'[]'``），不引入绑定
+        参数，也就没有注入面。
+        """
+        if ifnull is None:
+            return column_sql
+        if isinstance(ifnull, dict) and not ifnull:
+            return f"COALESCE({column_sql}, '{{}}')"
+        if isinstance(ifnull, (list, tuple)) and not ifnull:
+            return f"COALESCE({column_sql}, '[]')"
+        raise InvalidArgumentException(
+            "ifnull 仅接受空 dict（视为空对象）或空 list（视为空数组）")
+
+    def json_set(self, column_sql: str, pairs: Sequence[Any],
+                 ifnull: Any = None) -> str:
+        """``json_set(col, '$.a', ?, '$.b', ?)``。
+
+        多组路径/值编译进**同一次调用**：SQLite 允许 ``json_set`` 接受
+        任意多组参数，且该调用内部按顺序生效；若拆成同一列的两个 SET
+        子句，则只有最后一个生效（前者静默丢失）。
+        """
+        pairs = list(pairs)
+        if not pairs:
+            raise InvalidArgumentException("json_set 至少需要一组路径与值")
+        base = self._json_base(column_sql, ifnull)
+        args = ", ".join(f"{path}, {value_sql}" for path, value_sql in pairs)
+        return f"json_set({base}, {args})"
+
+    def json_insert(self, column_sql: str, pairs: Sequence[Any],
+                    ifnull: Any = None) -> str:
+        """``json_insert(col, '$.a', ?)`` —— 仅当路径不存在时写入。"""
+        pairs = list(pairs)
+        if not pairs:
+            raise InvalidArgumentException("json_insert 至少需要一组路径与值")
+        base = self._json_base(column_sql, ifnull)
+        args = ", ".join(f"{path}, {value_sql}" for path, value_sql in pairs)
+        return f"json_insert({base}, {args})"
+
+    def json_remove(self, column_sql: str, paths: Sequence[str],
+                    ifnull: Any = None) -> str:
+        """``json_remove(col, '$.a', '$.b')`` —— 删除路径，可多个。
+
+        路径不存在时静默忽略；多路径合并为一次调用，理由同
+        :meth:`json_set`（避免同列多 SET 子句互相覆盖）。
+        """
+        paths = list(paths)
+        if not paths:
+            raise InvalidArgumentException("json_remove 至少需要一个路径")
+        base = self._json_base(column_sql, ifnull)
+        return f"json_remove({base}, {', '.join(paths)})"
+
+    def json_patch(self, column_sql: str, value_sql: str,
+                   ifnull: Any = None) -> str:
+        """``json_patch(col, ?)`` —— RFC 7396 合并补丁。
+
+        SQLite 的 ``json_patch`` 会自行把第二个参数解析为 JSON，因此
+        ``json(?)`` 包装与裸文本绑定均可（见 test_json.py 语义用例）。
+        """
+        base = self._json_base(column_sql, ifnull)
+        return f"json_patch({base}, {value_sql})"
+
+    def json_bind(self, placeholder: str, value: Any) -> str:
+        """容器与布尔值需以 ``json(?)`` 包装。
+
+        若直接绑定文本参数，SQLite 会把嵌套对象存成**转义字符串**
+        （``{"n":"{\\"k\\":1}"}``）而非嵌套对象；``json(?)`` 让参数按
+        JSON 值解析。
+
+        布尔同样需要包装：直接绑定 ``True`` 会被 sqlite3 适配为整数 1，
+        落库成 ``1`` 而不是 JSON ``true``（``json_type`` 会报 ``integer``，
+        下游消费方看到的是数字）。包装后按 JSON 文本 ``'true'`` /
+        ``'false'`` 解析，保持类型保真。
+
+        标量（数字 / 文本 / ``None``）无需包装：json_set 会把 TEXT 参数
+        当 JSON 字符串、NULL 当 JSON null，语义已正确。
+        """
+        if isinstance(value, (dict, list, tuple, bool)):
+            return f"json({placeholder})"
+        return placeholder

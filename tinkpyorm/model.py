@@ -17,7 +17,7 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from .collection import Collection
 from .exceptions import OrmError, QueryError, RelationNotFound
 from .relation import Relation, HAS_ONE, HAS_MANY, BELONGS_TO, BELONGS_TO_MANY
-from .utils import to_snake
+from .utils import UNSET as _UNSET, to_snake
 
 _GETTER_PREFIXES = ("get_", "set_", "on_", "scope_", "search_", "_")
 
@@ -411,20 +411,76 @@ class Model(metaclass=MetaModel):
     def update(cls, data: dict, where: Any = None) -> int:
         """按条件更新: User.update({'name': 'x'}, {'id': 1})。"""
         q = cls.query()
-        if where is not None:
-            if callable(where):
-                where(q)
-            elif isinstance(where, dict):
-                q.where(where)
-            elif isinstance(where, (list, tuple)) and len(where) >= 2 and not isinstance(where[0], dict):
-                q.where(*where)
-            else:
-                q.where(cls.__pk__, where)
+        cls._apply_where(q, where)
         if cls.__timestamps__ and cls.__update_time__:
             data = dict(data)
             if cls._has_field(cls.__update_time__) and cls.__update_time__ not in data:
                 data[cls.__update_time__] = cls._now()
         return q.update(data)
+
+    @classmethod
+    def _apply_where(cls, q: "Query", where: Any) -> None:
+        """把多种 where 写法归一化到查询构造器上。
+
+        接受：闭包 ``lambda q: ...``、``dict``、
+        ``(字段, 值)`` / ``(字段, 运算符, 值)``、标量（视为主键值）。
+        """
+        if where is None:
+            return
+        if callable(where):
+            where(q)
+        elif isinstance(where, dict):
+            q.where(where)
+        elif (isinstance(where, (list, tuple)) and len(where) >= 2
+              and not isinstance(where[0], dict)):
+            q.where(*where)
+        else:
+            q.where(cls.__pk__, where)
+
+    # ---- JSON 路径写入（局部更新，v0.6.0） ---- #
+    @classmethod
+    def update_json(cls, field: str, path: Any = None, value: Any = _UNSET,
+                    where: Any = None, ifnull: Any = None) -> int:
+        """按 JSON 路径局部更新，返回影响行数::
+
+            User.update_json('extra', '$.age', 19, where={'id': 1})
+            User.update_json('extra', {'$.age': 19, '$.city': '上海'}, where=1)
+            User.update_json('extra', '$.vip', None, where={'id': 1})  # 写 null
+
+        与 :meth:`update` 对称：整列赋值用 ``update``，嵌套字段改写用本方法
+        （在 SQL 内完成，无读改写窗口）。
+
+        ``where`` 写法与 :meth:`update` 一致（闭包 / dict / 元组 / 主键值）；
+        省略 ``where`` 时不会自动追加条件，Builder 会拒绝无条件更新，
+        以防止全表改写。
+        """
+        q = cls.query()
+        cls._apply_where(q, where)
+        return q.update_json(field, path, value, ifnull)
+
+    @classmethod
+    def update_json_insert(cls, field: str, path: Any, value: Any,
+                           where: Any = None, ifnull: Any = None) -> int:
+        """按 JSON 路径写入，仅当路径不存在时生效（不覆盖已有值）。"""
+        q = cls.query()
+        cls._apply_where(q, where)
+        return q.update_json_insert(field, path, value, ifnull)
+
+    @classmethod
+    def update_json_remove(cls, field: str, path: Any,
+                           where: Any = None, ifnull: Any = None) -> int:
+        """删除 JSON 路径（可传多个路径的 list）。"""
+        q = cls.query()
+        cls._apply_where(q, where)
+        return q.update_json_remove(field, path, ifnull)
+
+    @classmethod
+    def update_json_patch(cls, field: str, patch: dict,
+                          where: Any = None, ifnull: Any = None) -> int:
+        """按 RFC 7396 合并补丁更新文档（补丁中的 ``null`` 表示删除键）。"""
+        q = cls.query()
+        cls._apply_where(q, where)
+        return q.update_json_patch(field, patch, ifnull)
 
     @classmethod
     def destroy(cls, condition: Any) -> int:

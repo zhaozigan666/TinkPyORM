@@ -235,8 +235,16 @@ class Driver(abc.ABC):
     #
     # 扩展新数据库时只需覆写本组方法（参照 SQLiteDriver）：
     #   MySQL   : JSON_EXTRACT(col, path) / JSON_CONTAINS / JSON_LENGTH
+    #             JSON_SET / JSON_INSERT / JSON_REMOVE / JSON_MERGE_PATCH
     #   Postgres: col #> path / col @> value::jsonb / jsonb_array_length
+    #             jsonb_set / col - path / col || patch
     #   MongoDB : 由 NoSQLDriver 承接，走原生 dict 查询，不产生 SQL
+    #             （路径写入映射为 $set / $unset 更新算子）
+    #
+    # 查询侧：json_extract / json_exists / json_contains / json_length /
+    #         json_type
+    # 写入侧：json_set / json_insert / json_remove / json_patch
+    # 编解码：json_decode / json_encode / json_bind
     def json_extract(self, column_sql: str, path: Any) -> str:
         """返回"提取 JSON 路径值"的 SQL 表达式。"""
         raise UnsupportedOperation(
@@ -271,6 +279,74 @@ class Driver(abc.ABC):
         raise UnsupportedOperation(
             f"{self.name} 驱动未实现 JSON 类型判断")
 
+    # ---- JSON 路径写入（局部更新） ---- #
+    # 与上方"路径查询"对称：查询用 json_extract 取值，
+    # 写入用 json_set 族在 SQL 内改写嵌套字段——省掉"先读出整列"的一次
+    # 往返与 Python 侧解析，并避免 read-modify-write 在并发交错下的丢失
+    # 更新（读改写方式下，后写者会整体覆盖先写者的改动）。
+    # 注意：存储层仍会重写整列 JSON 文本，写入放大与读改写相同。
+    #
+    # ``ifnull`` 参数用于处理"列为 SQL NULL"的边界：SQLite / MySQL 的
+    # json_set(NULL, ...) 会返回 NULL（静默无效）。传入空文档后驱动
+    # 以 COALESCE 兜底，使首批写入在空列上也能生效。
+    def json_set(self, column_sql: str, pairs: Sequence[Any],
+                 ifnull: Any = None) -> str:
+        """返回"按路径写入值（存在则覆盖、不存在则新增）"的表达式。
+
+        ``pairs`` 为 ``[(路径字面量, 值占位符), ...]``：路径已由
+        :func:`json_path_literal` 校验并转义，值片段由 :meth:`json_bind`
+        生成，二者均由 Builder 提供，驱动不得内联用户数据。
+
+        多个 ``(路径, 值)`` 必须编译进**同一次调用**，因为 SQL 中同一列
+        出现多个 SET 子句时只有最后一个生效（其余静默丢失）。
+        """
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 路径写入")
+
+    def json_insert(self, column_sql: str, pairs: Sequence[Any],
+                    ifnull: Any = None) -> str:
+        """返回"按路径写入值（**仅当路径不存在时**）"的表达式。
+
+        与 :meth:`json_set` 的区别是**不覆盖已有值**，适合初始化默认字段。
+        """
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 路径插入")
+
+    def json_remove(self, column_sql: str, paths: Sequence[str],
+                    ifnull: Any = None) -> str:
+        """返回"删除指定路径（可多个）"的表达式。
+
+        路径不存在时静默忽略，不报错。
+        """
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 路径删除")
+
+    def json_patch(self, column_sql: str, value_sql: str,
+                   ifnull: Any = None) -> str:
+        """返回"按 RFC 7396 JSON Merge Patch 合并文档"的表达式。
+
+        ``value_sql`` 为补丁文档的绑定片段（见 :meth:`json_bind`）。
+
+        **语义提示**：RFC 7396 中补丁里的 ``null`` 表示**删除该键**，
+        与 :meth:`json_set` 传入 ``null`` 表示"置为 JSON null"相反。
+        """
+        raise UnsupportedOperation(
+            f"{self.name} 驱动未实现 JSON 文档合并")
+
+    def json_bind(self, placeholder: str, value: Any) -> str:
+        """把占位符转换为"以 JSON 值绑定"的 SQL 片段。
+
+        默认原样返回（适用于把 JSON 以文本绑定的驱动）。需要类型化绑定的
+        驱动应覆写，例如 SQLite 用 ``json(?)`` 把文本参数解析为 JSON 值
+        （否则嵌套对象会被存成**转义字符串**、``True`` 会退化成整数 1），
+        MySQL 用 ``CAST(? AS JSON)``。
+
+        ``value`` 为原始 Python 值，驱动据此判断是否需要包装；容器与布尔
+        由 Builder 连同 **JSON 文本**一并绑定（见 ``Builder._json_bind_value``），
+        因此本方法的返回片段需与之一致。
+        """
+        return placeholder
+
     # ---- 值编解码（Python 层，与方言无关，通常无需覆写） ---- #
     def json_decode(self, value: Any) -> Any:
         """把数据库返回的 JSON 值解码为 Python 对象（dict / list / 标量）。
@@ -302,10 +378,14 @@ class Driver(abc.ABC):
     def json_encode(self, value: Any) -> Any:
         """把 Python 对象编码为可绑定参数。
 
-        ``dict`` / ``list`` -> JSON 文本；其余值原样返回（交由底层驱动
-        绑定）。``tuple`` / ``set`` 不在此处转换，避免破坏既有语义。
+        ``dict`` / ``list`` / ``tuple`` -> JSON 文本（``tuple`` 视为 JSON
+        数组：底层驱动无法绑定元组，不转换只会得到晦涩的绑定错误）；
+        其余值原样返回（交由底层驱动绑定）。
+
+        ``set`` / ``frozenset`` 不在此处转换：其元素无序，转成 JSON 数组
+        后顺序不确定，结果不可复现。
         """
-        if isinstance(value, (dict, list)):
+        if isinstance(value, (dict, list, tuple)):
             return json.dumps(value, ensure_ascii=False)
         return value
 

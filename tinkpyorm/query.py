@@ -15,11 +15,11 @@ import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import cache as _cache
-from .builder import Builder, JsonWhere, JSON_OPS, RawWhere
+from .builder import Builder, JsonUpdate, JsonWhere, JSON_OPS, RawWhere
 from .connection import Connection
 from .drivers import UnsupportedOperation, normalize_json_path
 from .exceptions import DataNotFound, InvalidArgumentException, QueryError
-from .utils import Raw, raw, to_snake
+from .utils import Raw, UNSET, raw, to_snake
 
 # SQLite 单语句绑定变量上限（SQLITE_MAX_VARIABLE_NUMBER）
 MAX_SQL_VARIABLES = 32766
@@ -29,8 +29,9 @@ MAX_SQL_VARIABLES = 32766
 _JSON_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?$")
 _JSON_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
-#: 参数未显式传入的哨兵（用于区分"省略运算符"与"传了 None"）
-_UNSET = object()
+#: 参数未显式传入的哨兵（用于区分"省略运算符/值"与"传了 None"）
+#: 定义在 utils 中以便 Model 层复用同一对象（身份比较必须是同一实例）
+_UNSET = UNSET
 
 
 class Query:
@@ -64,6 +65,7 @@ class Query:
             "comment": None,
             "alias": None,
             "data": None,       # insert/update 数据
+            "json_update": [],  # JSON 路径写入规格 [JsonUpdate, ...]
             "json": [],         # JSON 解码字段：[] 关闭 / [field,...] 指定 / True 自动嗅探
             "attr": {},         # withAttr 获取器 {field: callable}
             "filter": [],       # filter 回调列表
@@ -1003,7 +1005,16 @@ class Query:
         """更新数据，返回影响行数。必须存在 where 条件。"""
         if data is None:
             data = self.options.get("data") or {}
-        if not data:
+        return self._execute_update(data)
+
+    def _execute_update(self, data: dict) -> int:
+        """UPDATE 终端执行（普通字段更新与 JSON 路径更新共用）。
+
+        普通字段空但存在 JSON 路径写入规格时同样合法——二者最终拼进同一条
+        UPDATE 语句，具体合并由 Builder 负责。
+        """
+        specs = self.options.get("json_update") or []
+        if not data and not specs:
             raise QueryError("update 数据不能为空")
         self._apply_soft_delete()
         conn = self._resolve_conn()
@@ -1014,6 +1025,148 @@ class Query:
         affected = conn.execute(sql, params)
         self._invalidate_cache()
         return affected
+
+    # ------------------------------------------------------------------ #
+    # 终端方法：JSON 路径写入（局部更新，v0.6.0）
+    # ------------------------------------------------------------------ #
+    def update_json(self, field: str, path: Any = None,
+                    value: Any = _UNSET, ifnull: Any = None) -> int:
+        """按 JSON 路径**局部更新**，返回影响行数。需先指定 where 条件。
+
+        ::
+
+            # 单路径：把 $.age 置为 19
+            Db.table('user').where('id', 1).update_json('extra', '$.age', 19)
+
+            # 多路径：一次 SQL 内原子写入（推荐，避免多次往返）
+            Db.table('user').where('id', 1).update_json(
+                'extra', {'$.age': 19, '$.city': '上海'})
+
+            # 与 JSON 条件组合：给满足条件的记录打标
+            Db.table('user').where_json('extra', '$.age', '>', 30).update_json(
+                'extra', '$.level', 'gold')
+
+        相比"整对象读出 → Python 改 → 写回"，本方法在 SQL 内完成改写：
+
+        - **并发正确**：不存在"读—改—写"窗口，交错执行不会丢失更新
+          （读改写方式下，另一个写入会覆盖前一个的改动）；
+        - **少一次往返**：省掉读出整列的那条查询；
+        - **省 Python 侧解析**：无需 ``json.loads`` 后再 ``json.dumps``。
+
+        **写入量不变**：JSON 列以文本存储，``json_set`` 同样会重写整列
+        文本，写入放大与读改写一致；路径级写入的收益在往返、Python 侧
+        开销与并发正确性，不在磁盘写入量。
+
+        参数语义：
+
+        - ``path`` 传 ``dict`` 时按 ``{路径: 值}`` 展开为多路径写入；
+        - ``value`` 传 ``None`` 表示写入 JSON ``null``，**不是删除**
+          （删除请用 :meth:`update_json_remove`）；
+        - 值为 ``dict`` / ``list`` / ``tuple`` 时按 JSON 结构写入，
+          其余按标量写入；
+        - ``ifnull`` 处理"列为 SQL NULL"的边界：SQLite / MySQL 的
+          ``json_set(NULL, ...)`` 返回 NULL（更新静默无效），传 ``{}``
+          或 ``[]`` 可让空列先视为空文档。
+        """
+        return self._json_write("set", field, path, value, ifnull)
+
+    def update_json_insert(self, field: str, path: Any,
+                           value: Any = _UNSET,
+                           ifnull: Any = None) -> int:
+        """按 JSON 路径写入，**仅当路径不存在时**生效（同 ``json_insert``）。
+
+        适合初始化默认字段，不覆盖已有值::
+
+            Db.table('user').where('id', 1).update_json_insert(
+                'extra', '$.level', 'normal')
+        """
+        return self._json_write("insert", field, path, value, ifnull)
+
+    def update_json_remove(self, field: str, path: Any,
+                           ifnull: Any = None) -> int:
+        """删除 JSON 路径（可多个），路径不存在时静默忽略。
+
+        ::
+
+            Db.table('user').where('id', 1).update_json_remove('extra', '$.tmp')
+            Db.table('user').where('id', 1).update_json_remove(
+                'extra', ['$.tmp', '$.cache'])
+        """
+        return self._json_write("remove", field, path, _UNSET, ifnull)
+
+    def update_json_patch(self, field: str, patch: dict,
+                          ifnull: Any = None) -> int:
+        """按 RFC 7396 JSON Merge Patch 合并文档，返回影响行数。
+
+        ``patch`` 为补丁文档：对象**递归合并**，数组**整体替换**，
+        值为 ``null`` 表示**删除该键**::
+
+            Db.table('user').where('id', 1).update_json_patch(
+                'extra', {'level': 'gold', 'tmp': None})   # 同时写 level、删 tmp
+
+        **语义对比**：本方法里补丁的 ``null`` 是"删除键"，而
+        :meth:`update_json` 的值 ``null`` 是"置为 JSON null"，二者相反。
+        """
+        return self._json_write("patch", field, patch, _UNSET, ifnull)
+
+    def _json_write(self, mode: str, field: str, path: Any,
+                    value: Any, ifnull: Any) -> int:
+        """JSON 路径写入族统一入口：归一化参数后追加规格并执行 UPDATE。"""
+        self._require_json()
+        column = self._json_ident(field, "JSON 路径更新的列名")
+        self._json_ifnull(ifnull)
+        specs = self.options.setdefault("json_update", [])
+
+        if mode == "remove":
+            if value is not _UNSET:
+                raise InvalidArgumentException(
+                    "update_json_remove 不接受值参数（删除无需值）")
+            paths = list(path) if isinstance(path, (list, tuple)) else [path]
+            if not paths:
+                raise InvalidArgumentException(
+                    "update_json_remove 至少需要一个路径")
+            for p in paths:
+                specs.append(JsonUpdate(column, p, None, "remove", ifnull))
+        elif mode == "patch":
+            if not isinstance(path, dict):
+                raise InvalidArgumentException(
+                    "update_json_patch 的补丁必须是 dict（RFC 7396 文档）")
+            specs.append(JsonUpdate(column, None, path, "patch", ifnull))
+        elif isinstance(path, dict):
+            # 多路径写法 {路径: 值}
+            if value is not _UNSET:
+                raise InvalidArgumentException(
+                    "path 已用 dict 指定多路径，不应再传 value"
+                    "（值请写在 dict 内：{'$.a': 1, '$.b': 2}）")
+            if not path:
+                raise InvalidArgumentException("JSON 路径映射不能为空")
+            for p, v in path.items():
+                specs.append(JsonUpdate(column, p, v, mode, ifnull))
+        else:
+            if value is _UNSET:
+                raise InvalidArgumentException(
+                    "update_json 需要提供值；仅删除路径请用 "
+                    "update_json_remove()")
+            specs.append(JsonUpdate(column, path, value, mode, ifnull))
+
+        return self._execute_update(self.options.get("data") or {})
+
+    @staticmethod
+    def _json_ifnull(ifnull: Any) -> None:
+        """校验"空列兜底"取值：只允许空 ``dict`` / 空 ``list``。
+
+        兜底文档由驱动编译为**常量字面量**（``'{}'`` / ``'[]'``），不接受
+        任意字面量，从机制上避免把用户输入拼进 SQL。
+        """
+        if ifnull is None:
+            return
+        if isinstance(ifnull, dict) and not ifnull:
+            return
+        if isinstance(ifnull, (list, tuple)) and not ifnull:
+            return
+        raise InvalidArgumentException(
+            "ifnull 只接受空 dict（视为空对象）或空 list（视为空数组）；"
+            f"收到 {ifnull!r}")
 
     def delete(self, id: Optional[Any] = None) -> int:
         """删除数据，返回影响行数。``delete(1)`` 按主键删除。"""

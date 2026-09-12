@@ -424,5 +424,82 @@ ck("模型 to_dict 返回 dict",
 ck("模型配合 where_json 条件",
    lambda: len(JDoc.where_json("extra", "$.city", "北京").select()), 1)
 
+# ---------- JSON 路径级局部更新（v0.6.0） ----------
+ck("路径更新：重置基线",
+   lambda: Db.name("jdoc").where("name", "张三").update(
+       {"extra": {"age": 18, "city": "北京", "tags": ["vip", "new"], "note": None}}), 1)
+ck("update_json 单路径",
+   lambda: Db.name("jdoc").where("name", "张三").update_json("extra", "$.age", 19)
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["age"], 19)
+ck("update_json 其余键不受影响",
+   lambda: Db.name("jdoc").json().where("name", "张三").find()["extra"]["city"], "北京")
+ck("update_json 多路径一次写入",
+   lambda: Db.name("jdoc").where("name", "张三").update_json(
+       "extra", {"$.city": "上海", "$.level": "gold"})
+   and [Db.name("jdoc").json().where("name", "张三").find()["extra"][k]
+        for k in ("city", "level")], ["上海", "gold"])
+ck("update_json 嵌套对象不被转义",
+   lambda: Db.name("jdoc").where("name", "张三").update_json(
+       "extra", "$.profile", {"job": "dev"})
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["profile"],
+   {"job": "dev"})
+ck("update_json 布尔写 JSON true",
+   lambda: Db.name("jdoc").where("name", "张三").update_json("extra", "$.vip", True)
+   and Db.query("SELECT json_type(extra, '$.vip') AS t FROM jdoc "
+                "WHERE name = '张三'")[0]["t"], "true")
+ck("update_json None 是 JSON null 而非删除",
+   lambda: Db.name("jdoc").where("name", "张三").update_json("extra", "$.note", None)
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["note"] is None, True)
+ck("update_json_insert 已存在不覆盖",
+   lambda: Db.name("jdoc").where("name", "张三").update_json_insert("extra", "$.age", 99)
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["age"], 19)
+ck("update_json_insert 不存在则新增",
+   lambda: Db.name("jdoc").where("name", "张三").update_json_insert("extra", "$.init", 1)
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["init"], 1)
+ck("update_json_remove 单路径",
+   lambda: Db.name("jdoc").where("name", "张三").update_json_remove("extra", "$.tags")
+   and "tags" in Db.name("jdoc").json().where("name", "张三").find()["extra"], False)
+ck("update_json_remove 多路径",
+   lambda: Db.name("jdoc").where("name", "张三").update_json_remove(
+       "extra", ["$.level", "$.init"])
+   and [k for k in ("level", "init")
+        if k in Db.name("jdoc").json().where("name", "张三").find()["extra"]], [])
+ck("update_json_patch 递归合并",
+   lambda: Db.name("jdoc").where("name", "张三").update_json_patch(
+       "extra", {"profile": {"level": 2}})
+   and Db.name("jdoc").json().where("name", "张三").find()["extra"]["profile"],
+   {"job": "dev", "level": 2})
+ck("update_json_patch 中 null 表示删键",
+   lambda: Db.name("jdoc").where("name", "张三").update_json_patch("extra", {"note": None})
+   and "note" in Db.name("jdoc").json().where("name", "张三").find()["extra"], False)
+ck("where_json 条件 + update_json 写入",
+   lambda: Db.name("jdoc").where_json("extra", "$.age", ">", 20).update_json(
+       "extra", "$.senior", True)
+   and Db.name("jdoc").json().where("name", "李四").find()["extra"]["senior"], True)
+ck("ifnull={} 空列兜底",
+   lambda: Db.name("jdoc").insert({"name": "空列", "extra": None})
+   and Db.name("jdoc").where("name", "空列").update_json("extra", "$.a", 1, ifnull={})
+   and Db.name("jdoc").json().where("name", "空列").find()["extra"], {"a": 1})
+ck("raw() 在 SQL 内自增（两次都保留）",
+   lambda: (Db.name("jdoc").where("name", "空列").update_json("extra", "$.n", 0),
+            Db.name("jdoc").where("name", "空列").update_json(
+                "extra", "$.n", raw("json_extract(`extra`, '$.n') + 1")),
+            Db.name("jdoc").where("name", "空列").update_json(
+                "extra", "$.n", raw("json_extract(`extra`, '$.n') + 1")),
+            Db.name("jdoc").json().where("name", "空列").find()["extra"]["n"])[3], 2)
+ck("交错写入两个键都保留",
+   lambda: Db.name("jdoc").where("name", "空列").update_json("extra", "$.x", 1)
+   and Db.name("jdoc").where("name", "空列").update_json("extra", "$.y", 2)
+   and [k for k in ("a", "x", "y")
+        if k in Db.name("jdoc").json().where("name", "空列").find()["extra"]],
+   ["a", "x", "y"])
+ck("模型 update_json（where=dict）",
+   lambda: JDoc.update_json("extra", "$.age", 77, where={"name": "李四"})
+   and JDoc.where("name", "李四").find().extra["age"], 77)
+ck("模型 update_json_remove（where=闭包）",
+   lambda: JDoc.update_json_remove("extra", "$.senior",
+                                   where=lambda q: q.where("name", "李四"))
+   and "senior" in JDoc.where("name", "李四").find().extra, False)
+
 print("\nREADME 示例：通过 %d 项，失败 %d 项" % (ok, fail))
 sys.exit(1 if fail else 0)

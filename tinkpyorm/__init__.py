@@ -38,8 +38,20 @@ JSON 查询与自动格式化（v0.5.0）::
 写库时 ``dict`` / ``list`` 自动序列化为 JSON 文本，读库时自动还原为
 Python 对象；JSON 条件的 SQL 形态由驱动提供，可扩展至 MySQL / PostgreSQL
 （MongoDB / Redis 走原生对象，无需 SQL 层）。
+
+JSON 路径级局部更新（v0.6.0）::
+
+    Db.table("user").where("id", 1).update_json("extra", "$.age", 19)
+    Db.table("user").where("id", 1).update_json(
+        "extra", {"$.age": 19, "$.city": "上海"})       # 一次 SQL 原子写入
+    Db.table("user").where("id", 1).update_json_insert("extra", "$.level", "g")
+    Db.table("user").where("id", 1).update_json_remove("extra", ["$.tmp", "$.cache"])
+    Db.table("user").where("id", 1).update_json_patch("extra", {"tmp": None})
+
+在 SQL 内改写嵌套字段，没有"读出 → 改 → 写回"窗口，故并发交错时不会
+丢失更新；值与路径均经校验，值一律参数绑定。
 """
-from .builder import JsonWhere, JSON_OPS
+from .builder import JsonWhere, JsonUpdate, JSON_OPS, JSON_UPDATE_MODES
 from .cache import CacheStore, MemoryCacheStore
 from .collection import Collection, Paginator
 from .connection import Connection
@@ -59,14 +71,15 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore",
-    "JsonWhere", "JSON_OPS", "normalize_json_path",
+    "JsonWhere", "JsonUpdate", "JSON_OPS", "JSON_UPDATE_MODES",
+    "normalize_json_path",
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "register_driver", "get_driver", "available_drivers", "UnsupportedOperation",
     "OrmError", "QueryError", "DataNotFound", "ModelNotFound",

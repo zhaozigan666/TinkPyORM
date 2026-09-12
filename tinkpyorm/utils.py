@@ -11,8 +11,16 @@ from typing import Any, Callable, Union
 
 __all__ = [
     "Raw", "raw", "to_snake", "to_camel",
-    "parse_field", "parse_order", "is_raw",
+    "parse_field", "parse_order", "is_raw", "UNSET",
 ]
+
+#: 参数"未显式传入"的哨兵。
+#:
+#: 用于区分"调用方省略了该参数"与"调用方显式传了 ``None``"——后者在
+#: JSON 写入里是合法值（写入 JSON ``null``），不能被当作缺省处理。
+#: 放在 utils 而非 query，是因为 Model 层也需要用它（避免 model -> query
+#: 的反向模块依赖）。
+UNSET = object()
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

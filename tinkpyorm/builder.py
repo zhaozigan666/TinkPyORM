@@ -6,14 +6,16 @@
 from __future__ import annotations
 
 import json
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from .connection import Connection
-from .drivers import UnsupportedOperation
+from .drivers import UnsupportedOperation, json_path_literal
 from .exceptions import QueryError
 from .utils import Raw, parse_field, parse_order, is_raw
 
-__all__ = ["Builder", "RawWhere", "JsonWhere", "JSON_OPS"]
+__all__ = ["Builder", "RawWhere", "JsonWhere", "JsonUpdate",
+           "JSON_OPS", "JSON_UPDATE_MODES"]
 
 # 支持的比较运算符
 _OPS = {
@@ -30,21 +32,10 @@ JSON_OPS = {
     "exists", "not exists", "contains", "not contains",
 }
 
+# JSON 路径写入的操作类型（与查询侧 JSON_OPS 对称）
+JSON_UPDATE_MODES = ("set", "insert", "remove", "patch")
+
 _JOIN_TYPES = {"INNER", "LEFT", "RIGHT", "FULL", "CROSS"}
-
-
-class RawWhere:
-    """带参数绑定的原生 WHERE 片段（where_raw 使用）。
-
-    与 Raw 的区别：Raw 的值不绑定参数；RawWhere 支持 ``?`` 占位符
-    并携带对应参数。
-    """
-
-    __slots__ = ("sql", "params")
-
-    def __init__(self, sql: str, params: Sequence[Any] = ()):
-        self.sql = sql
-        self.params = list(params)
 
 
 class JsonWhere:
@@ -84,6 +75,40 @@ class JsonWhere:
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return (f"JsonWhere({self.column!r}, {self.path!r}, "
                 f"{self.op!r}, {self.value!r}, func={self.func!r})")
+
+
+class JsonUpdate:
+    """JSON 路径写入规格（由 ``Query.update_json()`` 族构造）。
+
+    与 :class:`JsonWhere` 对称：查询条件由驱动编译为 ``json_extract``，
+    路径写入由驱动编译为 ``json_set`` 族。Query 层只描述"改哪个路径、
+    写成什么值"，方言知识全部留在驱动层。
+
+    参数说明：
+
+    - ``column``：JSON 列名（已由 Query 校验为合法标识符）
+    - ``path``：JSON 路径；``patch`` 模式无路径（补丁自带键路径）
+    - ``value``：写入值，一律参数绑定；``patch`` 模式为补丁文档
+    - ``mode``：``set`` / ``insert`` / ``remove`` / ``patch``
+    - ``ifnull``：列为 SQL NULL 时的兜底空文档（``{}`` 或 ``[]``）
+
+    同一列的多个规格由 Builder 合并进**同一次** JSON 函数调用：SQL 中
+    同一列出现多个 SET 子句时只有最后一个生效，拆开会导致静默丢更新。
+    """
+
+    __slots__ = ("column", "path", "value", "mode", "ifnull")
+
+    def __init__(self, column: str, path: Any = None, value: Any = None,
+                 mode: str = "set", ifnull: Any = None):
+        self.column = column
+        self.path = path
+        self.value = value
+        self.mode = mode
+        self.ifnull = ifnull
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return (f"JsonUpdate({self.column!r}, {self.path!r}, "
+                f"{self.value!r}, mode={self.mode!r})")
 
 
 class RawWhere:
@@ -592,6 +617,115 @@ class Builder:
         return driver.limit_sql(limit)
 
     # ------------------------------------------------------------------ #
+    # JSON 路径写入（局部更新）
+    # ------------------------------------------------------------------ #
+    def _build_json_update(self, specs: List[JsonUpdate]) -> Tuple[list, list]:
+        """把 JSON 路径写入规格编译为 SET 子句与绑定参数。
+
+        编译策略（顺序敏感）：
+
+        1. **按列分组**：同一列的多个规格必须合并进一次调用——SQL 中同一
+           列出现多个 SET 子句时只有最后一个生效，其余静默丢失；
+        2. **相邻同类合并**：连续的 ``set`` / ``insert`` 合成一次调用
+           （``json_set(col, p1, v1, p2, v2)``），``remove`` 的多路径同理；
+        3. **异类按序嵌套**：``set`` 与 ``remove`` 混用时折叠为
+           ``json_remove(json_set(col, ...), ...)``。折叠是左嵌套，故
+           占位符在 SQL 中的出现顺序与参数追加顺序严格一致。
+
+        返回 ``(SET 子句列表, 绑定参数列表)``。
+        """
+        driver = self.conn.driver
+        if not getattr(driver, "supports_json", False):
+            raise UnsupportedOperation(
+                f"{driver.name} 驱动不支持 JSON 路径写入")
+        ph = driver.placeholder(1)
+
+        grouped: "OrderedDict[str, List[JsonUpdate]]" = OrderedDict()
+        for spec in specs:
+            if spec.mode not in JSON_UPDATE_MODES:
+                raise QueryError(
+                    f"不支持的 JSON 写入模式: {spec.mode!r}。可选: "
+                    + ", ".join(JSON_UPDATE_MODES))
+            grouped.setdefault(spec.column, []).append(spec)
+
+        set_sql: list = []
+        params: list = []
+        for column, ops in grouped.items():
+            # ifnull 只能作用于最内层基表达式（外层已保证非 NULL）
+            ifnull = next((o.ifnull for o in ops if o.ifnull is not None), None)
+            expr = self._qi(column)
+            first = True
+            i, total = 0, len(ops)
+            while i < total:
+                mode = ops[i].mode
+                j = i
+                while j < total and ops[j].mode == mode:
+                    j += 1
+                chunk = ops[i:j]
+                base_null = ifnull if first else None
+
+                if mode == "remove":
+                    expr = driver.json_remove(
+                        expr, [json_path_literal(o.path) for o in chunk],
+                        base_null)
+                elif mode == "patch":
+                    for k, o in enumerate(chunk):
+                        frag, needs, bind_val = self._json_value_fragment(
+                            driver, ph, o.value)
+                        expr = driver.json_patch(
+                            expr, frag, base_null if k == 0 else None)
+                        if needs:
+                            params.append(bind_val)
+                else:
+                    pairs, chunk_params = [], []
+                    for o in chunk:
+                        frag, needs, bind_val = self._json_value_fragment(
+                            driver, ph, o.value)
+                        pairs.append((json_path_literal(o.path), frag))
+                        if needs:
+                            chunk_params.append(bind_val)
+                    fn = driver.json_set if mode == "set" else driver.json_insert
+                    expr = fn(expr, pairs, base_null)
+                    params.extend(chunk_params)
+
+                first = False
+                i = j
+            set_sql.append(f"{self._qi(column)} = {expr}")
+        return set_sql, params
+
+    @classmethod
+    def _json_value_fragment(cls, driver: Any, placeholder: str,
+                             value: Any) -> Tuple[str, bool, Any]:
+        """把写入值编译为 SQL 片段与配套绑定值。
+
+        返回 ``(片段, 是否需要绑定, 绑定值)``：
+
+        - ``Raw``：片段直接内联（高级用法，如写入
+          ``json_extract(other, '$.x')`` 的结果），不产生绑定；
+        - 容器 / 布尔：片段由 :meth:`Driver.json_bind` 包装（SQLite 为
+          ``json(?)``），绑定值取 **JSON 文本**；
+        - 其余标量：片段为裸占位符，绑定值原样。
+        """
+        if is_raw(value):
+            return value.value, False, None
+        return (driver.json_bind(placeholder, value), True,
+                cls._json_bind_value(driver, value))
+
+    @staticmethod
+    def _json_bind_value(driver: Any, value: Any) -> Any:
+        """求 JSON 写入的绑定值。
+
+        - 容器：交驱动编码（SQL 驱动得到 JSON 文本，NoSQL 保持原生对象）；
+        - ``bool``：JSON 文本 ``'true'`` / ``'false'``——直接绑定会被
+          sqlite3 适配成整数 1/0，落库后 ``json_type`` 报 ``integer``，
+          下游看到数字而非 JSON 布尔，丢失类型保真；
+        - 其余（数字 / 文本 / ``None``）：原样绑定。
+        """
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return driver.json_encode(value)
+
+    # ------------------------------------------------------------------ #
     # INSERT / UPDATE / DELETE
     # ------------------------------------------------------------------ #
     def insert(self, options: dict, data: dict) -> Tuple[str, list]:
@@ -621,7 +755,22 @@ class Builder:
         return sql, params
 
     def update(self, options: dict, data: dict) -> Tuple[str, list]:
+        """编译 UPDATE 语句。
+
+        ``data`` 为普通字段赋值（``dict``/``list`` 值自动 JSON 编码），
+        ``options['json_update']`` 为 JSON 路径写入规格。二者作用于同一
+        字段时必须报错——SQL 中同一列出现多个 SET 子句只有最后一个生效，
+        会静默丢掉其中一个赋值。
+        """
         table = self._build_table(options)
+        specs: List[JsonUpdate] = options.get("json_update") or []
+        if specs and data:
+            overlap = set(data) & {s.column for s in specs}
+            if overlap:
+                raise QueryError(
+                    "字段不能同时出现在普通更新数据与 JSON 路径更新中："
+                    + ", ".join(sorted(overlap))
+                    + "（同列多个 SET 子句只有最后一个生效，会静默丢更新）")
         set_sql, set_params = [], []
         for field, value in data.items():
             if is_raw(value):
@@ -629,6 +778,12 @@ class Builder:
             else:
                 set_sql.append(f"{self._qi(field)} = ?")
                 set_params.append(self.conn.driver.json_encode(value))
+        if specs:
+            json_sql, json_params = self._build_json_update(specs)
+            set_sql.extend(json_sql)
+            set_params.extend(json_params)
+        if not set_sql:
+            raise QueryError("update 必须指定要更新的字段")
         where_sql, where_params = self.build_where(options.get("where", []))
         if not where_sql:
             raise QueryError("update 必须指定 where 条件（防止全表更新）")

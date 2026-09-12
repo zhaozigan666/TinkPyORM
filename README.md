@@ -99,6 +99,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **结果集与分页** —— `Collection`（`column / where / map / sum / to_json` …）+ `Paginator`
 - **camelCase 别名** —— `whereIn` 自动映射到 `where_in`，PHP/JS 开发者上手无阻
 - **JSON 字段查询** —— `json()` 结果自动格式化为 Python `dict`；`where_json` 家族支持路径条件（比较 / 存在 / 包含 / 长度 / 类型），`field_json` / `order_json` 提取与排序，写入侧自动序列化；SQL 形态由驱动提供，可扩展至 MySQL / MongoDB / Redis
+- **JSON 路径写入** —— `update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch` 在 SQL 内改写嵌套字段，无读改写窗口（并发交错不丢更新），与路径查询对称
 - **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
@@ -753,6 +754,85 @@ Db.table('user').order_json('extra', '$.score', 'desc').select()
 `field_json` 走独立通道，与 `field()` 的调用顺序无关（不会被覆盖）；
 生成的别名字段自动纳入解码列表，无需再调用 `json()`。
 
+### 路径级局部更新
+
+写入侧与条件查询对称，同样在 SQL 内改写嵌套字段：
+
+```python
+# 单路径：只改 $.age，其余键不动
+Db.table('user').where('id', 1).update_json('extra', '$.age', 19)
+
+# 多路径：压进一条语句原子写入（推荐，避免多次往返）
+Db.table('user').where('id', 1).update_json(
+    'extra', {'$.age': 19, '$.city': '上海'})
+
+# 仅当路径不存在时写入（不覆盖已有值，适合初始化默认字段）
+Db.table('user').where('id', 1).update_json_insert('extra', '$.level', 'normal')
+
+# 删除路径（可传多个）
+Db.table('user').where('id', 1).update_json_remove('extra', ['$.tmp', '$.cache'])
+
+# RFC 7396 合并补丁：对象递归合并、数组整体替换、null 表示删除键
+Db.table('user').where('id', 1).update_json_patch(
+    'extra', {'level': 'gold', 'tmp': None})
+
+# 与 JSON 条件组合：给满足条件的记录打标
+Db.table('user').where_json('extra', '$.age', '>', 30).update_json(
+    'extra', '$.level', 'senior')
+```
+
+| 方法 | 语义 | 底层函数 |
+|---|---|---|
+| `update_json` | 存在则覆盖、不存在则新增 | `json_set` |
+| `update_json_insert` | 仅当路径不存在时写入 | `json_insert` |
+| `update_json_remove` | 删除路径（可多个） | `json_remove` |
+| `update_json_patch` | RFC 7396 合并补丁 | `json_patch` |
+
+值为 Python 容器时按 JSON 结构写入（`{'job': 'dev'}` 落库为嵌套对象，
+不会被转义成字符串）；`True` / `False` 写入 JSON `true` / `false`，类型保真。
+
+**为什么不"读出 → 改 → 写回"**：那条路存在读改写窗口，两个交错执行的
+更新会互相覆盖（先写者的改动丢失）：
+
+```python
+# 读改写：a 的改动被 b 的整列写回覆盖
+a = Db.table('doc').json(['val']).find(1)['val']
+b = Db.table('doc').json(['val']).find(1)['val']
+a['a'] = 1; Db.table('doc').where('id', 1).update({'val': a})
+b['b'] = 1; Db.table('doc').where('id', 1).update({'val': b})
+# 结果：{'b': 1}        ← a 丢了
+```
+
+`update_json` 在 SQL 内完成改写，同样时序下两个键都保留 → `{'a': 1, 'b': 1}`。
+配合 `raw()` 还能做 SQL 内算术自增（两次自增都保留，不会退化成 1）：
+
+```python
+from tinkpyorm import raw
+expr = raw("json_extract(`val`, '$.n') + 1")
+Db.table('cnt').where('id', 1).update_json('val', '$.n', expr)
+```
+
+几点须知：
+
+1. **必须有 where 条件**：无条件路径更新会改写全表，与 `update()` 一样
+   直接拒绝（`QueryError`）。
+2. **列为 NULL 时默认静默无效**：`json_set(NULL, ...)` 返回 NULL。传
+   `ifnull={}`（或 `[]`）可让空列先视为空文档：
+   `update_json('extra', '$.a', 1, ifnull={})`。
+3. **`null` 的两种相反含义**：`update_json(..., None)` 是"置为 JSON null"，
+   而 `update_json_patch(..., {'k': None})` 是"删除键 k"。
+4. **写入量不变**：JSON 列以文本存储，`json_set` 同样重写整列文本，写入
+   放大与读改写一致。收益在少一次往返、省 Python 侧解析、并发正确性。
+5. 与 `update()` 一样是**终端方法**（立即执行并返回影响行数），不能像
+   `where_json()` 那样继续链式拼接。
+
+模型层可用同名方法，`where` 写法与 `Model.update` 一致：
+
+```python
+User.update_json('extra', '$.age', 19, where={'id': 1})
+User.update_json_remove('extra', '$.tmp', where=lambda q: q.where('id', 1))
+```
+
 ### 安全性
 
 - **路径**：经白名单校验后才内联为 SQL 字面量，非法路径（`$.a' OR '1'='1`）
@@ -760,6 +840,13 @@ Db.table('user').order_json('extra', '$.score', 'desc').select()
 - **列名 / 别名**：校验为合法标识符，杜绝 `field_json(..., 'x; DROP TABLE')`
   这类拼接注入。
 - **值**：一律参数绑定，与其它条件查询同一套机制。
+- **写入侧同一套闸口**：`update_json` 族的列名、路径走相同的白名单校验，
+  值全部参数绑定（容器与布尔以 JSON 文本绑定，再由 `json(?)` 解析）；
+  `ifnull` 只接受空 `dict` / 空 `list`，由驱动编译为**常量字面量**
+  （`'{}'` / `'[]'`），不接受任意字面量。
+- **同列多 SET 防护**：同一列的路径写入被合并进一次函数调用——SQL 中同列
+  出现多个 SET 子句时只有最后一个生效。若同一字段同时出现在普通更新数据
+  与路径写入中，直接抛 `QueryError` 而不是静默丢更新。
 
 ### 多数据库扩展
 
@@ -774,6 +861,10 @@ JSON 条件的 SQL 形态由**驱动**提供，Query / Builder 层不含任何�
 | 数组包含 | `json_each` + EXISTS | `JSON_CONTAINS` | 原生 |
 | 元素个数 | `json_each` 计数 | `JSON_LENGTH` | 原生 |
 | 类型判断 | `json_type` | `JSON_TYPE` | 原生 |
+| 路径写入 | `json_set` / `json_insert` | `JSON_SET` / `JSON_INSERT` | `$set` 更新算子 |
+| 路径删除 | `json_remove` | `JSON_REMOVE` | `$unset` 更新算子 |
+| 文档合并 | `json_patch` | `JSON_MERGE_PATCH` | `$merge` / 客户端合并 |
+| JSON 类型绑定 | `json(?)` | `CAST(? AS JSON)` | 原生对象 |
 | 值解码 | JSON 文本 → dict | 同 SQLite | **恒等透传**（已是 Python 对象） |
 
 MongoDB / Redis 走 `NoSQLDriver`，`json_decode` / `json_encode` 为恒等函数，
@@ -791,8 +882,11 @@ MongoDB / Redis 走 `NoSQLDriver`，`json_decode` / `json_encode` 为恒等函�
    `where_raw` 配合 `json_extract`。
 2. **自动嗅探的误判**：`json()` 无参会把形如 `'[1,2]'`、`'"text"'` 的普通
    字符串一并解析。字段语义固定时请用 `json(['extra'])` 显式声明。
-3. **布尔映射**：Python `True` / `False` 与 JSON `true` / `false` 在 SQLite 中
-   以整数 1 / 0 存储，条件查询已自动转换，无需手动处理。
+3. **布尔在条件中的映射**：`where_json(..., True)` 会转成 `= 1` 比较——
+   SQLite 的 `json_extract` 对 JSON `true` 返回整数 1，故能正确命中。
+   写入侧（`insert` / `update` 的整列赋值与 `update_json` 族）一律落库为
+   JSON `true` / `false`，类型保真。
+4. **路径写入列需为 NULL 时**：见「路径级局部更新」须知 2（`ifnull`）。
 
 ---
 
@@ -1254,6 +1348,7 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 | 字段 | `field` `field_raw` `without_field` `distinct` `json` `with_attr` `filter` |
 | 条件 | `where` `where_or` `where_xor` `where_null` `where_not_null` `where_in` `where_not_in` `where_like` `where_not_like` `where_between` `where_not_between` `where_column` `where_exists` `where_not_exists` `where_raw` |
 | JSON | `json([fields])` `where_json` `where_json_or` `where_json_null` `where_json_not_null` `where_json_exists` `where_json_not_exists` `where_json_contains` `where_json_not_contains` `where_json_length` `where_json_type` `field_json` `order_json` |
+| JSON 写入 | `update_json` `update_json_insert` `update_json_remove` `update_json_patch` |
 | 连接 | `join` `left_join` `right_join` `inner_join` |
 | 组合 | `union` `union_all` |
 | 分组排序 | `group` `having` `having_or` `order` `order_raw` |
@@ -1316,25 +1411,26 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 
 ```bash
 # 单元测试
-python test_tinkpyorm.py            # 33 项：查询构造 / 写入 / 事务 / 模型 / 软删除 / 关联
-python test_drivers.py              #  9 项：驱动抽象层（注册表 / 方言钩子）
-python test_cache.py                # 24 项：查询缓存（TTL / 失效 / LRU / 后端替换）
-python test_stream_concurrency.py   # 21 项：流式读取（chunk/cursor）与多线程安全
+python test_tinkpyorm.py            #  33 项：查询构造 / 写入 / 事务 / 模型 / 软删除 / 关联
+python test_drivers.py              #   9 项：驱动抽象层（注册表 / 方言钩子）
+python test_cache.py                #  24 项：查询缓存（TTL / 失效 / LRU / 后端替换）
+python test_stream_concurrency.py   #  21 项：流式读取（chunk/cursor）与多线程安全
+python test_json.py                 # 176 项：JSON 读写（序列化 / 路径查询 / 路径写入 / 安全）
 
 # 冒烟测试（端到端，覆盖全链路 API）
 python smoke_test.py
 
-# README 示例回归测试（127 项，逐条校验本文档中的用法示例）
+# README 示例回归测试（169 项，逐条校验本文档中的用法示例）
 python test_readme_examples.py
 ```
 
-预期输出（合计 87 项单元测试 + 127 项示例）：
+预期输出（合计 263 项单元测试 + 169 项示例）：
 
 ```
-Ran 33 tests in 1.6s
+Ran 176 tests in 0.1s
 OK
 ...
-README 示例：通过 127 项，失败 0 项
+README 示例：通过 169 项，失败 0 项
 ```
 
 ---
@@ -1351,21 +1447,21 @@ TinkPyORM/
 │   ├── cache.py          # 查询缓存（进程级 + TTL + LRU + 可替换后端）
 │   ├── drivers/          # 驱动抽象层（base / sqlite，可扩展多数据库方言）
 │   ├── connection.py     # 连接门面：查询/执行/事务(SAVEPOINT)/日志/线程锁
-│   ├── builder.py        # SQL 编译器：options → SQL（含 JSON 路径条件编译）
-│   ├── query.py          # 查询构造器：全链式 + 预载入 + JSON 查询 + 缓存/流式
+│   ├── builder.py        # SQL 编译器：options → SQL（含 JSON 条件/写入编译）
+│   ├── query.py          # 查询构造器：链式 + 预载入 + JSON 查询/写入 + 缓存/流式
 │   ├── collection.py     # Collection 结果集 + Paginator 分页
 │   ├── relation.py       # 关联实现：4 种类型 + 批量预载入
 │   ├── model.py          # Model 基类 + MetaModel 元类（scope/camelCase/静态代理）
 │   └── db.py             # Db 门面：连接管理、入口、事务、日志、缓存
 ├── docs/
-│   └── json-query.md           # JSON 查询设计 + 多数据库扩展映射
+│   └── json-query.md           # JSON 查询/写入设计 + 多数据库扩展映射
 ├── test_tinkpyorm.py           # 核心测试（33 项）
 ├── test_drivers.py             # 驱动抽象层测试（9 项）
 ├── test_cache.py               # 查询缓存测试（24 项）
 ├── test_stream_concurrency.py  # 流式读取与并发测试（21 项）
-├── test_json.py                # JSON 查询与自动格式化测试（78 项）
+├── test_json.py                # JSON 读写测试（176 项）
 ├── smoke_test.py               # 端到端冒烟测试
-├── test_readme_examples.py     # README 示例回归测试（150 项）
+├── test_readme_examples.py     # README 示例回归测试（169 项）
 ├── benchmark_vs_sqlite3.py     # 与原生 sqlite3 的性能对照基准
 ├── PERFORMANCE.md              # 性能报告与优化记录
 └── README.md
@@ -1392,6 +1488,40 @@ TinkPyORM/
 ---
 
 ## 更新记录
+
+### v0.6.0
+
+**JSON 路径写入（局部更新）**——补齐与路径查询对称的写入侧能力，形成
+"写入序列化 → 路径查询 → 路径写入 → 结果解码"的完整闭环：
+
+1. **驱动层新增写入扩展点** —— `Driver` 增加 `json_set` / `json_insert` /
+   `json_remove` / `json_patch` / `json_bind`；`SQLiteDriver` 给出完整参考实现。
+   `json_bind` 解决两个必须包装的场景：容器值若不包 `json(?)` 会被存成
+   **转义字符串**；布尔若直接绑定会被 sqlite3 适配成整数 1/0，丢失 JSON 类型
+   （现按 JSON 文本 `'true'` / `'false'` 绑定，`json_type` 报 `true` / `false`）。
+2. **Query 新增四个终端方法** —— `update_json`（`json_set`，存在覆盖、不存在
+   新增）/ `update_json_insert`（`json_insert`，不覆盖已有值）/
+   `update_json_remove`（`json_remove`，支持多路径）/
+   `update_json_patch`（`json_patch`，RFC 7396）。均支持 `where` 条件组合、
+   `fetch_sql`、缓存自动失效、事务回滚。
+3. **多路径原子写入** —— `update_json(field, {'$.a': 1, '$.b': 2})` 编译为
+   **一次** `json_set` 调用。这是正确性要求而非优化：SQL 中同一列出现多个
+   SET 子句时只有最后一个生效，拆开会导致静默丢更新。
+4. **空列兜底 `ifnull`** —— `json_set(NULL, ...)` 返回 NULL（更新静默无效），
+   传 `ifnull={}` / `[]` 令驱动编译为 `COALESCE(col, '{}')`。兜底文档是常量
+   字面量，不引入绑定参数、无注入面。
+5. **Model 层入口** —— `Model.update_json` 族，`where` 写法与 `Model.update`
+   一致（闭包 / dict / 元组 / 主键值）。抽出 `_apply_where` 供两者复用。
+6. **安全** —— 列名、路径、`ifnull` 三重校验；值一律绑定（含容器与布尔，
+   以 JSON 文本绑定后由 `json(?)` 解析）；同字段同时出现在普通更新数据与路径
+   写入中直接抛 `QueryError`。
+7. **顺带清理** —— `builder.py` 中 `RawWhere` 重复定义（后定义覆盖前者）已删除；
+   `_UNSET` 哨兵统一下沉到 `utils.UNSET` 供 Model 层复用；`Driver.json_encode`
+   支持 `tuple`（底层驱动无法绑定元组，原行为是晦涩的绑定错误）。
+8. **测试与文档** —— `test_json.py` 由 78 项扩至 176 项，合计 263 项单元测试
+   + 169 项 README 示例全量通过；README 新增「路径级局部更新」；新增
+   `docs/json-query.md` 写入侧章节；`PERFORMANCE.md` 新增第十二节（实测差异
+   与并发丢更新对照）。
 
 ### v0.5.0
 
