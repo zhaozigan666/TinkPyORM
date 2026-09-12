@@ -53,7 +53,9 @@ class Db:
 
         修复性行为（相对 v0.2.0）：
         * 未知配置键归入驱动 options，不再透传底层驱动引发 TypeError；
-        * 非法 ``type`` 立即报错，不再静默按 SQLite 处理。
+        * 未注册的 ``type`` 立即报错，不再静默按 SQLite 处理。合法性以活驱动
+          注册表为准，故 ``register_driver("oracle", OracleDriver)`` 之后
+          ``{'type': 'oracle'}`` 即为合法配置（v0.7.1 起）。
         """
         if isinstance(config, Connection):
             conn = config

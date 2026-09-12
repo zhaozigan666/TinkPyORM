@@ -60,10 +60,25 @@ JSON 路径级局部更新（v0.6.0）::
 
 在 SQL 内改写嵌套字段，没有"读出 → 改 → 写回"窗口，故并发交错时不会
 丢失更新；值与路径均经校验，值一律参数绑定。
+
+扩展新数据库（v0.7.1 起配置层跟上注册表）::
+
+    from tinkpyorm import register_driver, available_type_names, SQLDriver
+
+    @register_driver("oracle")                 # 1. 实现驱动并注册
+    class OracleDriver(SQLDriver): ...
+
+    Db.set_config({"type": "oracle", "database": "x"})   # 2. 注册后立即可用
+    available_type_names()                     # 当前可配置的类型名
+
+``type`` 的合法性以活驱动注册表为准（内置保留名 ∪ 已注册驱动名）；未注册的
+类型在配置阶段即报错并提示注册方式。MySQL / PostgreSQL / MongoDB / Redis
+等属"预留名"：配置阶段放行，到建立连接时才抛 ``DriverNotAvailable``。
 """
 from .builder import JsonWhere, JsonUpdate, JSON_OPS, JSON_UPDATE_MODES
 from .cache import CacheStore, MemoryCacheStore
 from .collection import Collection, Paginator
+from .config import available_type_names
 from .connection import Connection
 from .db import Db
 from .drivers import (
@@ -81,7 +96,7 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 
 __all__ = [
@@ -89,7 +104,7 @@ __all__ = [
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore",
     "JsonWhere", "JsonUpdate", "JSON_OPS", "JSON_UPDATE_MODES",
-    "normalize_json_path",
+    "normalize_json_path", "available_type_names",
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "register_driver", "get_driver", "available_drivers", "UnsupportedOperation",
     "OrmError", "QueryError", "DataNotFound", "ModelNotFound",

@@ -1489,7 +1489,7 @@ Db.sql_log_disable()   # 每条 SQL 约 220 字节；默认保留 1000 条，长
 ```bash
 # 单元测试
 python test_tinkpyorm.py            #  33 项：查询构造 / 写入 / 事务 / 模型 / 软删除 / 关联
-python test_drivers.py              #   9 项：驱动抽象层（注册表 / 方言钩子）
+python test_drivers.py              #  16 项：驱动抽象层（注册表 / 方言钩子 / 自定义驱动配置）
 python test_cache.py                #  24 项：查询缓存（TTL / 失效 / LRU / 后端替换）
 python test_stream_concurrency.py   #  21 项：流式读取（chunk/cursor）与多线程安全
 python test_json.py                 # 241 项：JSON 读写（序列化 / 路径查询 / 路径写入 / 安全）
@@ -1501,10 +1501,10 @@ python smoke_test.py
 python test_readme_examples.py
 ```
 
-预期输出（合计 328 项单元测试 + 174 项示例）：
+预期输出（合计 335 项单元测试 + 174 项示例）：
 
 ```
-Ran 176 tests in 0.1s
+Ran 241 tests in 0.1s
 OK
 ...
 README 示例：通过 174 项，失败 0 项
@@ -1533,7 +1533,7 @@ TinkPyORM/
 ├── docs/
 │   └── json-query.md           # JSON 查询/写入设计 + 多数据库扩展映射
 ├── test_tinkpyorm.py           # 核心测试（33 项）
-├── test_drivers.py             # 驱动抽象层测试（9 项）
+├── test_drivers.py             # 驱动抽象层测试（16 项）
 ├── test_cache.py               # 查询缓存测试（24 项）
 ├── test_stream_concurrency.py  # 流式读取与并发测试（21 项）
 ├── test_json.py                # JSON 读写测试（241 项）
@@ -1548,7 +1548,19 @@ TinkPyORM/
 
 ## 注意事项与已知限制
 
-1. **内置驱动仅 SQLite**。驱动抽象层（`tinkpyorm.drivers`）已就位：新增数据库只需实现一个驱动类并注册，`Connection` / `Builder` / `Query` / `Model` 无需改动；MySQL / PostgreSQL 等驱动尚未提供。
+1. **内置驱动仅 SQLite**。驱动抽象层（`tinkpyorm.drivers`）已就位：新增数据库只需实现一个驱动类并用 `@register_driver("名字")` 注册，`Connection` / `Builder` / `Query` / `Model` 无需改动；MySQL / PostgreSQL 等驱动尚未提供。
+
+   `type` 的合法性以**活注册表**为准（内置保留名 ∪ 已注册驱动名），因此注册后即可直接配置：
+
+   ```python
+   @register_driver("oracle")
+   class OracleDriver(SQLDriver): ...
+
+   Db.set_config({"type": "oracle", "database": "x"})   # 注册后立即合法
+   available_type_names()                               # 当前可配置的类型名
+   ```
+
+   未注册的类型立即抛 `InvalidArgumentException`，错误信息会列出已注册清单并提示注册方式。注意 `mysql` / `postgresql` / `mssql` / `mongodb` / `redis` 属**预留名**：配置阶段放行，到建立连接时才因缺少驱动实现抛 `DriverNotAvailable`。
 2. **`with_` 不是 `with`**：`with` 是 Python 保留关键字，预载入方法必须写成 `with_()`。
 3. **`raw()` 不做转义**。它按字面量拼进 SQL，只应传入你自己硬编码的表达式，绝不可传入未校验的用户输入。
 4. **`without_field` 有额外开销**：SQLite 不支持 `SELECT * EXCEPT(col)`，实现上先查 `PRAGMA table_info()` 推导出完整字段列表再剔除，多一次元数据查询。
@@ -1565,6 +1577,33 @@ TinkPyORM/
 ---
 
 ## 更新记录
+
+### v0.7.1
+
+**修复：`type` 校验与驱动注册表脱节，自定义驱动无法配置**（破坏"新增数据库只需
+实现驱动并注册"的扩展承诺）：
+
+1. **根因** —— `config.normalize_type()` 只对照静态白名单 `KNOWN_TYPES`
+   （由内置别名表 `TYPE_ALIASES` 派生）判定合法性，与 `drivers._DRIVERS`
+   活注册表**完全脱节**。于是 `register_driver("oracle", OracleDriver)` 之后
+   `{"type": "oracle"}` 仍被 `Config` 拒绝，扩展路径在配置层即断裂。此前测试
+   只能用 `object.__new__(Config)` 绕过校验构造配置，是这一缺陷的直接症状。
+2. **修复** —— 校验改为"先查内置保留名（快路径、零导入），未命中再查活驱动
+   注册表"。`drivers/base.py` 反向依赖 `config`（`from ..config import Config`），
+   故注册表查询必须**惰性导入**，否则形成循环导入；驱动层抛错时退化为内置集合，
+   不连带阻断配置构造。注册表查询不缓存——注册动作之后立即生效。
+3. **新增 `available_type_names()`** —— 返回当前可配置的类型名（内置保留名 ∪
+   已注册驱动名），并从包顶层导出，便于排查"为何我的 type 被拒"。
+4. **错误信息可执行化** —— 未注册类型改为列出**活注册表**清单并给出
+   `register_driver('名字', YourDriver)` 的注册指引。
+5. **边界保持不变** —— 别名解析（`mariadb` → `mysql`）与"预留名"语义不变：
+   `mysql` / `postgresql` / `mssql` / `mongodb` / `redis` 配置阶段放行，到建立
+   连接时才因缺少驱动实现抛 `DriverNotAvailable`。
+6. **测试** —— `test_drivers.py` 由 9 项扩至 16 项：新增 `TestCustomDriverConfig`
+   覆盖自定义驱动的配置构造、`from_dict`、`Db.set_config` 端到端真实查询、
+   别名解析、预留名边界、未注册拒绝、注册表非缓存；同时移除既有用例中的
+   `object.__new__(Config)` 绕过写法，改为走真实构造路径。合计 335 项单元测试
+   + 174 项 README 示例全量通过。
 
 ### v0.7.0
 

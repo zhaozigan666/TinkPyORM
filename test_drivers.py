@@ -11,12 +11,13 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinkpyorm import Db, DriverNotAvailable
-from tinkpyorm.config import Config
+from tinkpyorm import Db, DriverNotAvailable, InvalidArgumentException
+from tinkpyorm.config import Config, available_type_names, normalize_type
 from tinkpyorm.drivers import (
-    Driver, NoSQLDriver, SQLDriver, UnsupportedOperation,
+    Driver, NoSQLDriver, SQLDriver, SQLiteDriver, UnsupportedOperation,
     available_drivers, get_driver, register_driver,
 )
+from tinkpyorm.drivers import _DRIVERS
 
 TMP_DIR = os.path.join(tempfile.gettempdir(), "tinkpyorm_drv_test")
 
@@ -24,6 +25,25 @@ TMP_DIR = os.path.join(tempfile.gettempdir(), "tinkpyorm_drv_test")
 def _mem_config() -> Config:
     """内存库 sqlite 配置（驱动单测用）。"""
     return Config(database=":memory:")
+
+
+class CustomSQLDriver(SQLiteDriver):
+    """第三方驱动样例：复用 SQLite 执行，仅覆写标识符引用风格（PG 风格）。"""
+
+    name = "custom_sql"
+
+    def _wrap_identifier(self, name: str) -> str:
+        return f'"{name}"'
+
+
+def _register_custom_sql_driver() -> None:
+    """幂等注册第三方驱动样例。"""
+    _DRIVERS.setdefault("custom_sql", CustomSQLDriver)
+
+
+def _drop_driver(name: str) -> None:
+    """从注册表移除测试驱动，避免跨用例污染全局注册表。"""
+    _DRIVERS.pop(name, None)
 
 
 class TestDriverAbstraction(unittest.TestCase):
@@ -82,19 +102,12 @@ class TestDriverAbstraction(unittest.TestCase):
                     sql += f" OFFSET {int(offset)}"
                 return sql
 
+        self.addCleanup(_drop_driver, "mock")
         cls = get_driver("mock")
         self.assertIs(cls, MockDriver)
-        # 构造一个 mock-typed config（避开 KNOWN_TYPES 校验：直接 __new__）
-        cfg = object.__new__(Config)
-        cfg.type = "mock"
-        cfg.database = ":memory:"
-        cfg.options = {}
-        cfg.host = cfg.port = cfg.user = cfg.password = None
-        cfg.prefix = ""
-        cfg.connect_timeout = None
-        cfg.sql_log_enabled = True
-        cfg.sql_log_max = 1000
-        cfg.path_expand = False
+        # v0.7.1：注册名可通过 Config 校验（此前需 object.__new__ 绕过白名单）
+        cfg = Config(type="mock", database=":memory:")
+        self.assertEqual(cfg.type, "mock")
         d = cls(cfg)
         # 上层 Builder 的方言切换在 mock 驱动下立即生效
         self.assertEqual(d._wrap_identifier("x"), '"x"')
@@ -124,21 +137,92 @@ class TestDriverAbstraction(unittest.TestCase):
             def connect(self): return object()
             def close(self): pass
 
-        cfg = object.__new__(Config)
-        cfg.type = "test_nosql"
-        cfg.database = ":memory:"
-        cfg.options = {}
-        cfg.host = cfg.port = cfg.user = cfg.password = None
-        cfg.prefix = ""
-        cfg.connect_timeout = None
-        cfg.sql_log_enabled = True
-        cfg.sql_log_max = 1000
-        cfg.path_expand = False
+        self.addCleanup(_drop_driver, "test_nosql")
+        cfg = Config(type="test_nosql", database=":memory:")
         d = FakeNoSQL(cfg)
         with self.assertRaises(UnsupportedOperation):
             d.select("SELECT 1")
         with self.assertRaises(UnsupportedOperation):
             d.begin()
+
+
+class TestCustomDriverConfig(unittest.TestCase):
+    """v0.7.1：``type`` 校验必须对照**活驱动注册表**，而非静态白名单。
+
+    修复前 :func:`normalize_type` 只认 ``KNOWN_TYPES``，导致第三方驱动
+    ``register_driver("oracle", ...)`` 之后 ``{"type": "oracle"}`` 仍被拒，
+    "新增数据库只需实现驱动并注册" 的扩展承诺在配置层即断裂。
+    """
+
+    def setUp(self):
+        os.makedirs(TMP_DIR, exist_ok=True)
+        self.addCleanup(_drop_driver, "custom_sql")
+        # 复位全局连接，避免自定义驱动泄漏到后续测试模块。
+        # 用 set_config 显式重建默认连接（Db.close() 亦可用：驱动把底层连接
+        # 置空后由 connect() 惰性重连，故关闭后的默认连接不会失效）。
+        self.addCleanup(Db.set_config, {"database": ":memory:"})
+
+    # ---------------------------------------------------------------- #
+    # 接受
+    # ---------------------------------------------------------------- #
+    def test_registered_driver_accepted_by_config(self):
+        """Config 直接构造 / from_dict 均接受已注册的驱动名。"""
+        _register_custom_sql_driver()
+
+        self.assertEqual(Config(type="custom_sql", database=":memory:").type,
+                         "custom_sql")
+        self.assertEqual(
+            Config.from_dict({"type": "custom_sql", "database": ":memory:"}).type,
+            "custom_sql")
+
+    def test_available_type_names_includes_registered(self):
+        _register_custom_sql_driver()
+        self.assertIn("custom_sql", available_type_names())
+
+    def test_set_config_end_to_end(self):
+        """Db.set_config 指定自定义驱动后，链式查询真实可用（上层零改动）。"""
+        _register_custom_sql_driver()
+        path = os.path.join(TMP_DIR, "custom.db")
+        conn = Db.set_config({"type": "custom_sql", "database": path})
+        self.assertEqual(type(conn.driver).__name__, "CustomSQLDriver")
+
+        Db.execute("DROP TABLE IF EXISTS custom_probe")
+        Db.execute("CREATE TABLE custom_probe (id INTEGER PRIMARY KEY, v TEXT)")
+        Db.table("custom_probe").insert({"id": 1, "v": "ok"})
+        self.assertEqual(Db.table("custom_probe").where("id", 1).value("v"), "ok")
+        self.assertEqual(conn.driver._wrap_identifier("x"), '"x"')
+
+    def test_alias_of_registered_driver_still_resolves(self):
+        """别名解析不受影响（内置别名表优先命中）。"""
+        self.assertEqual(normalize_type("mariadb"), "mysql")
+        self.assertEqual(normalize_type("POSTGRES"), "postgresql")
+
+    # ---------------------------------------------------------------- #
+    # 拒绝 / 边界
+    # ---------------------------------------------------------------- #
+    def test_unregistered_type_still_rejected(self):
+        """未注册的类型仍拒绝，且错误信息给出已注册清单与注册指引。"""
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            normalize_type("nosuchdb")
+        msg = str(ctx.exception)
+        self.assertIn("nosuchdb", msg)
+        self.assertIn("register_driver", msg)
+        self.assertIn("sqlite", msg)          # 列出活注册表而非静态白名单
+
+    def test_reserved_type_passes_config_but_fails_at_connect(self):
+        """预留名（mysql 等）配置阶段放行，连接阶段才抛 DriverNotAvailable。"""
+        cfg = Config(type="mysql", database="app")
+        self.assertEqual(cfg.type, "mysql")
+        with self.assertRaises(DriverNotAvailable):
+            get_driver("mysql")
+
+    def test_registry_lookup_is_live_not_cached(self):
+        """注册表查询不缓存：注册动作之后校验立即通过。"""
+        self.assertNotIn("custom_sql", available_type_names())
+        with self.assertRaises(InvalidArgumentException):
+            normalize_type("custom_sql")
+        _register_custom_sql_driver()
+        self.assertEqual(normalize_type("custom_sql"), "custom_sql")
 
 
 if __name__ == "__main__":

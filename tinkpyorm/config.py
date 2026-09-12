@@ -5,7 +5,9 @@ v0.3.1 起撤销"集中式配置"（Config/DatabaseManager/DSN/环境变量/配�
 驱动实例化所需的极简值对象 :class:`Config` 与类型校验逻辑。
 
 字段语义:
-    type        驱动名（sqlite/mysql/postgresql/...），未知类型立即报错；
+    type        驱动名（sqlite/mysql/postgresql/...），未注册的类型立即报错。
+                合法性以**活驱动注册表**为准（内置名 + ``register_driver()``
+                运行时注册的第三方驱动），故自定义驱动可直接用其名配置；
     database    库文件路径 / 库名；
     prefix      表前缀（由 ``Db.set_config`` 消费）；
     options     驱动专属参数（如 SQLite 的 journal_mode / timeout），
@@ -39,7 +41,10 @@ TYPE_ALIASES: Dict[str, str] = {
     "redis": "redis",
 }
 
-#: 所有合法（已识别）的驱动名
+#: 内置（保留）驱动名 —— 别名映射的目标集合。这些名字无需驱动实现即可在
+#: 配置阶段通过校验（MySQL / PostgreSQL 等属"预留名"，实到连接时才会因缺少
+#: 驱动实现而抛 ``DriverNotAvailable``）。第三方驱动的合法性不在此表内，
+#: 而由活注册表判定，见 :func:`_registered_types` 与 :func:`available_type_names`。
 KNOWN_TYPES = frozenset(TYPE_ALIASES.values())
 
 #: 通用配置键。其余键一律归入驱动专属 options。
@@ -93,15 +98,42 @@ def _coerce(field_name: str, value: Any) -> Any:
     return value
 
 
+def _registered_types() -> frozenset:
+    """取驱动注册表中当前可用的驱动名（含运行时注册的第三方驱动）。
+
+    惰性导入是**必需**而非优化：``drivers/base.py`` 反向依赖本模块
+    （``from ..config import Config``），模块级导入会造成循环导入。
+
+    驱动层抛错时退化为空集合：驱动层故障不应连带让配置构造失败，
+    校验随即回落到 :data:`KNOWN_TYPES`（行为等同修复前）。
+    """
+    try:
+        from .drivers import available_drivers
+    except Exception:  # pragma: no cover - 驱动层异常不应阻断配置
+        return frozenset()
+    return frozenset(available_drivers())
+
+
+def available_type_names() -> frozenset:
+    """当前可用的数据库类型名（内置保留名 ∪ 已注册驱动名）。"""
+    return KNOWN_TYPES | _registered_types()
+
+
 def normalize_type(value: Optional[str]) -> str:
-    """规范化并校验数据库类型，未知类型抛异常。"""
+    """规范化并校验数据库类型，未注册的类型抛异常。
+
+    校验顺序：先查内置保留名（快路径，零导入），未命中再查活驱动注册表。
+    后者使 ``register_driver("oracle", OracleDriver)`` 之后
+    ``{"type": "oracle"}`` 立即成为合法配置。
+    """
     raw = str(value or DEFAULT_TYPE).strip().lower()
     name = TYPE_ALIASES.get(raw, raw)
-    if name not in KNOWN_TYPES:
-        raise InvalidArgumentException(
-            f"未知的数据库类型: {value!r}。"
-            f"可选类型: {', '.join(sorted(KNOWN_TYPES))}")
-    return name
+    if name in KNOWN_TYPES or name in _registered_types():
+        return name
+    raise InvalidArgumentException(
+        f"未知的数据库类型: {value!r}。"
+        f"可选类型: {', '.join(sorted(available_type_names()))}。"
+        f"自定义驱动需先注册: register_driver({raw!r}, YourDriver)")
 
 
 @dataclass
