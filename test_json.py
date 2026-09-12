@@ -17,8 +17,8 @@ import unittest
 
 from tinkpyorm import (
     Db, Model, Query, Connection, SQLDriver, NoSQLDriver,
-    JsonWhere, UnsupportedOperation, InvalidArgumentException, QueryError,
-    normalize_json_path, register_driver,
+    JsonWhere, JsonUpdate, UnsupportedOperation, InvalidArgumentException,
+    QueryError, normalize_json_path, raw, register_driver,
 )
 from tinkpyorm.config import Config
 
@@ -1160,6 +1160,458 @@ class TestModelUpdateJson(JsonWriteTestCase):
 
         with self.assertRaises(QueryError):
             User.update_json("extra", "$.a", 1)
+
+
+# ---------------------------------------------------------------------- #
+# 11. 操作列表入口：一条语句内混合多种路径操作（v0.7.0）
+# ---------------------------------------------------------------------- #
+class TestUpdateJsonOpsMixed(JsonWriteTestCase):
+    """update_json_ops()：五种元素写法与混合操作语义。"""
+
+    def test_set_and_remove_in_one_statement(self):
+        n = Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.age", 19), ("remove", "$.note")])
+        self.assertEqual(n, 1)
+        extra = self.extra("张三")
+        self.assertEqual(extra["age"], 19)
+        self.assertNotIn("note", extra)
+
+    def test_five_element_forms_in_one_call(self):
+        Db.table("user").where("name", "张三").update_json_ops("extra", [
+            ("set", "$.age", 19),
+            {"$.city": "广州", "$.vip": True},
+            ("insert", "$.level", "normal"),
+            ("remove", ["$.deleted", "$.note"]),
+            ("patch", {"meta": {"v": 2}}),
+        ])
+        extra = self.extra("张三")
+        self.assertEqual(extra["age"], 19)
+        self.assertEqual(extra["city"], "广州")
+        self.assertIs(extra["vip"], True)
+        self.assertEqual(extra["level"], "normal")
+        self.assertNotIn("deleted", extra)
+        self.assertNotIn("note", extra)
+        self.assertEqual(extra["meta"], {"v": 2})
+
+    def test_insert_does_not_overwrite_existing(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("insert", "$.age", 99)])
+        self.assertEqual(self.extra("张三")["age"], 18)
+
+    def test_insert_writes_missing_key(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("insert", "$.level", "VIP")])
+        self.assertEqual(self.extra("张三")["level"], "VIP")
+
+    def test_patch_null_deletes_key(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("patch", {"note": None, "added": {"a": 1}})])
+        extra = self.extra("张三")
+        self.assertNotIn("note", extra)
+        self.assertEqual(extra["added"], {"a": 1})
+
+    def test_remove_multiple_paths_with_list(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("remove", ["$.note", "$.deleted", "$.score"])])
+        extra = self.extra("张三")
+        for key in ("note", "deleted", "score"):
+            self.assertNotIn(key, extra)
+
+    def test_dict_shorthand_expands_to_set(self):
+        Db.table("user").where("name", "李四").update_json_ops(
+            "extra", [{"$.age": 26, "$.city": "深圳"}])
+        extra = self.extra("李四")
+        self.assertEqual(extra["age"], 26)
+        self.assertEqual(extra["city"], "深圳")
+
+    def test_nested_object_not_escaped(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.profile", {"job": "dev", "tags": ["py"]})])
+        self.assertEqual(self.extra("张三")["profile"],
+                         {"job": "dev", "tags": ["py"]})
+
+    def test_boolean_kept_as_json_boolean(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.flag", True), ("set", "$.neg", False)])
+        self.assertEqual(self.jtype("张三", "$.flag"), "true")
+        self.assertEqual(self.jtype("张三", "$.neg"), "false")
+        self.assertIs(self.extra("张三")["flag"], True)
+
+    def test_null_value_is_json_null_not_delete(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.city", None)])
+        extra = self.extra("张三")
+        self.assertIn("city", extra)
+        self.assertIsNone(extra["city"])
+
+    def test_raw_expression_in_ops(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.age",
+                       raw("json_extract(`extra`, '$.age') + 1"))])
+        self.assertEqual(self.extra("张三")["age"], 19)
+
+    def test_untouched_keys_preserved(self):
+        before = self.extra("张三")
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.age", 19)])
+        after = self.extra("张三")
+        self.assertEqual(after["tags"], before["tags"])
+        self.assertEqual(after["score"], before["score"])
+        self.assertEqual(set(after), set(before))
+
+
+class TestUpdateJsonOpsOrder(JsonWriteTestCase):
+    """列表顺序即应用顺序（SQL 侧折叠为左嵌套）。"""
+
+    def test_set_then_remove_deletes_path(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.age", 99), ("remove", "$.age")])
+        self.assertNotIn("age", self.extra("张三"))
+
+    def test_remove_then_set_keeps_value(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("remove", "$.age"), ("set", "$.age", 99)])
+        self.assertEqual(self.extra("张三")["age"], 99)
+
+    def test_set_then_insert_keeps_set_value(self):
+        # insert 不覆盖既有路径，故 set 写的值保留
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.age", 99), ("insert", "$.age", 1)])
+        self.assertEqual(self.extra("张三")["age"], 99)
+
+    def test_insert_then_set_overwrites(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("insert", "$.age", 1), ("set", "$.age", 99)])
+        self.assertEqual(self.extra("张三")["age"], 99)
+
+    def test_remove_then_insert_recreates_key(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("remove", "$.age"), ("insert", "$.age", 7)])
+        self.assertEqual(self.extra("张三")["age"], 7)
+
+    def test_patch_then_set_overwrites_patch_result(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("patch", {"age": 1}), ("set", "$.age", 42)])
+        self.assertEqual(self.extra("张三")["age"], 42)
+
+    def test_adjacent_same_mode_merged_last_wins(self):
+        # 相邻同类被合并进一次 json_set；SQLite 对同一次调用内的重复路径
+        # 同样"后者胜"，因此合并不改变语义
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.newkey", 1), ("set", "$.newkey", 2)])
+        self.assertEqual(self.extra("张三")["newkey"], 2)
+
+    def test_multiple_alternations_applied_in_order(self):
+        Db.table("user").where("name", "张三").update_json_ops("extra", [
+            ("set", "$.k", 1), ("remove", "$.k"),
+            ("set", "$.k", 2), ("remove", "$.k"),
+            ("set", "$.k", 3),
+        ])
+        self.assertEqual(self.extra("张三")["k"], 3)
+
+
+class TestUpdateJsonOpsSqlShape(JsonWriteTestCase):
+    """编译形态：单列折叠为一次函数调用，参数顺序与占位符一致。"""
+
+    def test_single_set(self):
+        sql, params = self.raw_sql(
+            lambda q: q.update_json_ops("extra", [("set", "$.a", 1)]))
+        self.assertEqual(
+            sql, "UPDATE `user` SET `extra` = json_set(`extra`, '$.a', ?)")
+        self.assertEqual(params, [1])
+
+    def test_mixed_is_left_nested(self):
+        sql, _ = self.raw_sql(lambda q: q.update_json_ops("extra", [
+            ("set", "$.a", 1), ("remove", "$.b"), ("set", "$.c", 2)]))
+        self.assertIn(
+            "json_set(json_remove(json_set(`extra`, '$.a', ?), '$.b'), "
+            "'$.c', ?)", sql)
+
+    def test_patch_wrapped_as_json_value(self):
+        sql, params = self.raw_sql(
+            lambda q: q.update_json_ops("extra", [("patch", {"k": 1})]))
+        self.assertIn("json_patch(`extra`, json(?)", sql)
+        self.assertEqual(params, ['{"k": 1}'])
+
+    def test_insert_uses_json_insert(self):
+        sql, _ = self.raw_sql(
+            lambda q: q.update_json_ops("extra", [("insert", "$.a", 1)]))
+        self.assertIn("json_insert(`extra`, '$.a', ?)", sql)
+
+    def test_remove_multi_paths_in_one_call(self):
+        sql, _ = self.raw_sql(
+            lambda q: q.update_json_ops("extra", [("remove", ["$.a", "$.b"])]))
+        self.assertIn("json_remove(`extra`, '$.a', '$.b')", sql)
+
+    def test_params_order_matches_placeholders(self):
+        sql, params = self.raw_sql(lambda q: q.update_json_ops("extra", [
+            ("set", "$.a", "A"), ("remove", "$.b"),
+            ("insert", "$.c", "C"), ("patch", {"p": 1})]))
+        self.assertEqual(params, ["A", "C", '{"p": 1}'])
+        self.assertEqual(sql.count("?"), 3)
+
+    def test_value_never_inlined(self):
+        payload = "x'); DROP TABLE user; --"
+        sql, params = self.raw_sql(
+            lambda q: q.update_json_ops("extra", [("set", "$.s", payload)]))
+        self.assertNotIn("DROP TABLE", sql)
+        self.assertEqual(params, [payload])
+
+    def test_fetch_sql_does_not_write(self):
+        q = Db.table("user").where("name", "张三").fetch_sql()
+        q.update_json_ops("extra", [("set", "$.ghost", 1)])
+        self.assertNotIn("ghost", self.extra("张三"))
+
+
+class TestUpdateJsonOpsMultiColumn(JsonWriteTestCase):
+    """JsonUpdate 实例元素自带列名 -> 一条语句改多个 JSON 列。"""
+
+    def setUp(self):
+        super().setUp()
+        Db.execute("ALTER TABLE user ADD COLUMN meta TEXT")
+        Db.table("user").where("name", "张三").update({"meta": {"m": 1}})
+
+    def meta(self, name):
+        return (Db.table("user").json(["meta"])
+                .where("name", name).find()["meta"])
+
+    def test_two_columns_in_one_statement(self):
+        Db.table("user").where("name", "张三").update_json_ops("extra", [
+            JsonUpdate("extra", "$.x", 1, "set"),
+            JsonUpdate("meta", "$.m", 100, "set"),
+            JsonUpdate("meta", "$.n", "added", "insert"),
+        ])
+        self.assertEqual(self.extra("张三")["x"], 1)
+        self.assertEqual(self.meta("张三"), {"m": 100, "n": "added"})
+
+    def test_sql_has_two_set_clauses(self):
+        sql, _ = self.raw_sql(lambda q: q.update_json_ops("extra", [
+            JsonUpdate("extra", "$.x", 1, "set"),
+            JsonUpdate("meta", "$.m", 2, "set"),
+        ]))
+        self.assertIn("`extra` = json_set(`extra`", sql)
+        self.assertIn("`meta` = json_set(`meta`", sql)
+
+    def test_instance_column_wins_over_field(self):
+        # field 只是默认列；实例自带列名优先，故此处只改 meta
+        Db.table("user").where("name", "张三").update_json_ops("extra", [
+            JsonUpdate("meta", "$.only", 1, "set")])
+        self.assertEqual(self.meta("张三")["only"], 1)
+        self.assertNotIn("only", self.extra("张三"))
+
+
+class TestUpdateJsonOpsSafety(JsonWriteTestCase):
+    """操作列表的构造期校验：不生成半成品 SQL，也不留下半成品状态。"""
+
+    def test_empty_ops_rejected(self):
+        for empty in ([], ()):
+            with self.assertRaises(InvalidArgumentException):
+                Db.table("user").where("id", 1).update_json_ops("extra", empty)
+
+    def test_ops_must_be_sequence(self):
+        for bad in ("set", {"$.a": 1}, 123, None):
+            with self.assertRaises(InvalidArgumentException):
+                Db.table("user").where("id", 1).update_json_ops("extra", bad)
+
+    def test_element_type_rejected(self):
+        for bad in (123, None, "set"):
+            with self.assertRaises(InvalidArgumentException):
+                Db.table("user").where("id", 1).update_json_ops("extra", [bad])
+
+    def test_too_short_tuple_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops("extra", [("set",)])
+
+    def test_invalid_mode_rejected(self):
+        for bad in ("upsert", "delete", "sets", "", "s e t"):
+            with self.assertRaises(InvalidArgumentException):
+                Db.table("user").where("id", 1).update_json_ops(
+                    "extra", [(bad, "$.a", 1)])
+
+    def test_mode_is_case_insensitive(self):
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("Set", "$.case", 1), ("REMOVE", "$.note")])
+        extra = self.extra("张三")
+        self.assertEqual(extra["case"], 1)
+        self.assertNotIn("note", extra)
+
+    def test_patch_requires_two_elements(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [("patch", "$.a", {"k": 1})])
+
+    def test_patch_value_must_be_dict(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [("patch", [1, 2])])
+
+    def test_remove_rejects_value(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [("remove", "$.a", 1)])
+
+    def test_remove_empty_paths_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [("remove", [])])
+
+    def test_set_missing_value_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [("set", "$.a")])
+
+    def test_set_path_dict_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [("set", {"$.a": 1}, 1)])
+
+    def test_empty_dict_element_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops("extra", [{}])
+
+    def test_jsonupdate_bad_mode_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.table("user").where("id", 1).update_json_ops(
+                "extra", [JsonUpdate("extra", "$.a", 1, "upsert")])
+
+    def test_without_where_rejected(self):
+        with self.assertRaises(QueryError):
+            Db.table("user").update_json_ops("extra", [("set", "$.a", 1)])
+
+    def test_invalid_column_rejected(self):
+        for bad in ("extra) OR 1=1 --", "extra; DROP TABLE user", ""):
+            with self.assertRaises(InvalidArgumentException):
+                Db.table("user").where("id", 1).update_json_ops(
+                    bad, [("set", "$.a", 1)])
+
+    def test_invalid_path_rejected(self):
+        for bad in ("$.a' OR '1'='1", "$.a;--", "$[x]"):
+            with self.assertRaises(InvalidArgumentException):
+                Db.table("user").where("id", 1).update_json_ops(
+                    "extra", [("set", bad, 1)])
+
+    def test_failed_ops_leave_no_partial_state(self):
+        q = Db.table("user").where("id", 1)
+        with self.assertRaises(InvalidArgumentException):
+            q.update_json_ops("extra", [("set", "$.ok", 1), ("nope", "$.x", 1)])
+        self.assertEqual(q.options["json_update"], [])
+
+    def test_table_intact_after_injection_attempts(self):
+        for bad_col, bad_path in (("extra) OR 1=1 --", "$.a"),
+                                  ("extra", "$.a' OR '1'='1")):
+            try:
+                Db.table("user").where("id", 1).update_json_ops(
+                    bad_col, [("set", bad_path, 1)])
+            except Exception:
+                pass
+        self.assertEqual(
+            Db.query("SELECT count(*) AS n FROM user")[0]["n"], 3)
+
+
+class TestUpdateJsonOpsIntegration(JsonWriteTestCase):
+    """与 JSON 条件、缓存、事务、NULL 列的协同。"""
+
+    def test_where_json_combination(self):
+        n = Db.table("user").where_json("extra", "$.age", ">", 20).update_json_ops(
+            "extra", [("set", "$.senior", True)])
+        self.assertEqual(n, 2)
+        self.assertIs(self.extra("李四")["senior"], True)
+        self.assertNotIn("senior", self.extra("张三"))
+
+    def test_cache_invalidated(self):
+        Db.clear_cache()
+        _ = Db.table("user").json(["extra"]).where("id", 1).cache(60).find()
+        Db.table("user").where("id", 1).update_json_ops(
+            "extra", [("set", "$.cached", 1)])
+        got = Db.table("user").json(["extra"]).where("id", 1).cache(60).find()
+        self.assertEqual(got["extra"]["cached"], 1)
+
+    def test_transaction_rollback(self):
+        try:
+            with Db.transaction():
+                Db.table("user").where("id", 1).update_json_ops(
+                    "extra", [("set", "$.tx", 1)])
+                raise RuntimeError("boom")
+        except RuntimeError:
+            pass
+        self.assertNotIn("tx", self.extra("张三"))
+
+    def test_no_match_returns_zero(self):
+        self.assertEqual(
+            Db.table("user").where("id", 999).update_json_ops(
+                "extra", [("set", "$.a", 1)]), 0)
+
+    def test_null_column_without_ifnull_is_noop(self):
+        Db.execute("UPDATE user SET extra = NULL WHERE name = '张三'")
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.a", 1)])
+        self.assertIsNone(self.extra("张三"))
+
+    def test_null_column_with_ifnull(self):
+        Db.execute("UPDATE user SET extra = NULL WHERE name = '张三'")
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.a", 1), ("set", "$.b", 2)], ifnull={})
+        self.assertEqual(self.extra("张三"), {"a": 1, "b": 2})
+
+    def test_multi_row_update(self):
+        n = Db.table("user").where_in("name", ["张三", "王五"]).update_json_ops(
+            "extra", [("set", "$.capital", True)])
+        self.assertEqual(n, 2)
+        self.assertIs(self.extra("张三")["capital"], True)
+        self.assertIs(self.extra("王五")["capital"], True)
+
+
+class TestModelUpdateJsonOps(JsonWriteTestCase):
+    """模型层入口：where 写法与 Model.update 一致。"""
+
+    def test_where_dict(self):
+        class User(Model):
+            __table__ = "user"
+            __json__ = ["extra"]
+
+        n = User.update_json_ops(
+            "extra", [("set", "$.age", 77), ("remove", "$.note")],
+            where={"name": "张三"})
+        self.assertEqual(n, 1)
+        extra = self.extra("张三")
+        self.assertEqual(extra["age"], 77)
+        self.assertNotIn("note", extra)
+
+    def test_where_callable(self):
+        class User(Model):
+            __table__ = "user"
+            __json__ = ["extra"]
+
+        User.update_json_ops("extra", [("set", "$.mark", 1)],
+                             where=lambda q: q.where("name", "李四"))
+        self.assertEqual(self.extra("李四")["mark"], 1)
+
+    def test_where_pk_scalar(self):
+        class User(Model):
+            __table__ = "user"
+            __json__ = ["extra"]
+
+        User.update_json_ops("extra", [("set", "$.mark", 2)], where=3)
+        self.assertEqual(self.extra("王五")["mark"], 2)
+
+    def test_missing_where_rejected(self):
+        class User(Model):
+            __table__ = "user"
+            __json__ = ["extra"]
+
+        with self.assertRaises(QueryError):
+            User.update_json_ops("extra", [("set", "$.a", 1)])
+
+    def test_model_ops_signature_accepts_ifnull(self):
+        class User(Model):
+            __table__ = "user"
+            __json__ = ["extra"]
+
+        Db.execute("UPDATE user SET extra = NULL WHERE name = '王五'")
+        n = User.update_json_ops("extra", [("set", "$.a", 1)],
+                                 where={"name": "王五"}, ifnull={})
+        self.assertEqual(n, 1)
+        self.assertEqual(self.extra("王五"), {"a": 1})
 
 
 class TestJsonWriteDriverContract(unittest.TestCase):

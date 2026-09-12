@@ -483,6 +483,24 @@ class Model(metaclass=MetaModel):
         return q.update_json_patch(field, patch, ifnull)
 
     @classmethod
+    def update_json_ops(cls, field: str, ops: Any,
+                        where: Any = None, ifnull: Any = None) -> int:
+        """在一条 UPDATE 内按序应用多个 JSON 路径操作::
+
+            User.update_json_ops('extra', [
+                ('set',    '$.age', 19),
+                ('remove', '$.tmp'),
+            ], where={'id': 1})
+
+        操作列表写法见 :meth:`Query.update_json_ops`（支持元组、
+        ``{路径: 值}`` 简写与 :class:`~tinkpyorm.builder.JsonUpdate` 实例）；
+        ``where`` 写法与 :meth:`update` 一致。
+        """
+        q = cls.query()
+        cls._apply_where(q, where)
+        return q.update_json_ops(field, ops, ifnull)
+
+    @classmethod
     def destroy(cls, condition: Any) -> int:
         """删除：destroy(1) / destroy([1,2,3]) / destroy({'status': 0}) / destroy(closure)。
 

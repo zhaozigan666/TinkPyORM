@@ -15,7 +15,9 @@ import re
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
 from . import cache as _cache
-from .builder import Builder, JsonUpdate, JsonWhere, JSON_OPS, RawWhere
+from .builder import (
+    Builder, JsonUpdate, JsonWhere, JSON_OPS, JSON_UPDATE_MODES, RawWhere,
+)
 from .connection import Connection
 from .drivers import UnsupportedOperation, normalize_json_path
 from .exceptions import DataNotFound, InvalidArgumentException, QueryError
@@ -1108,6 +1110,137 @@ class Query:
         :meth:`update_json` 的值 ``null`` 是"置为 JSON null"，二者相反。
         """
         return self._json_write("patch", field, patch, _UNSET, ifnull)
+
+    def update_json_ops(self, field: str, ops: Sequence[Any],
+                        ifnull: Any = None) -> int:
+        """在**一条** UPDATE 语句内按序应用多个 JSON 路径操作。
+
+        上面每个 ``update_json_*`` 方法一次只表达一种操作；本方法接受操作
+        列表，把 ``set`` / ``insert`` / ``remove`` / ``patch`` 混合编译进
+        同一条语句，按列表顺序依次生效::
+
+            Db.table('user').where('id', 1).update_json_ops('extra', [
+                ('set',    '$.age', 19),        # 改值
+                ('remove', '$.tmp'),            # 删键
+                ('insert', '$.level', 'vip'),   # 不存在才写
+                ('patch',  {'meta': {'v': 2}}), # RFC 7396 合并
+                ('remove', ['$.a', '$.b']),     # 一次删多个
+            ])
+
+        操作元素支持五种写法（模式取 ``JSON_UPDATE_MODES``，大小写不敏感）：
+
+        1. ``(模式, 路径, 值)`` —— ``set`` / ``insert`` 用这种三元组；
+        2. ``(模式, 路径)`` —— ``remove`` 用（删除无需值）；``路径`` 传
+           ``list`` 可一次删除多个；
+        3. ``(模式, 补丁文档)`` —— ``patch`` 用（补丁自带键路径，无路径元素）；
+        4. ``{路径: 值}`` —— ``set`` 多路径简写，等价于
+           ``update_json(field, {...})``；
+        5. :class:`~tinkpyorm.builder.JsonUpdate` 实例 —— 高级用法，可自带
+           列名，因而能在**一条语句内改多个 JSON 列**。
+
+        顺序语义（已实测确认）：
+
+        - **列表顺序即应用顺序**：``[('set','$.a',1), ('remove','$.a')]``
+          最终删除 ``$.a``；颠倒两者顺序则保留为 ``1``；
+        - 相邻同类操作会被合并进同一次函数调用
+          （``json_set(col, p1, v1, p2, v2)``）；SQLite 对同一次调用内的
+          重复路径同样**后者胜**，故合并不改变语义；
+        - ``patch`` 的 ``null`` 语义是"删除该键"，与 :meth:`update_json`
+          的值 ``null``（置为 JSON null）相反。
+
+        非法模式、缺失值、``patch`` 非 ``dict``、``remove`` 带值等均在
+        构造阶段抛 ``InvalidArgumentException``，不会生成半成品 SQL。
+        """
+        self._require_json()
+        column = self._json_ident(field, "JSON 路径更新的列名")
+        self._json_ifnull(ifnull)
+        if not isinstance(ops, (list, tuple)):
+            raise InvalidArgumentException(
+                "update_json_ops 需要操作列表（list / tuple），"
+                f"收到 {type(ops).__name__}")
+        if not ops:
+            raise InvalidArgumentException("update_json_ops 的操作列表不能为空")
+        # 先全量解析校验，通过后再写入状态：避免中途失败留下半成品规格
+        pending: List[JsonUpdate] = []
+        for op in ops:
+            pending.extend(self._json_op_specs(column, op, ifnull))
+        self.options.setdefault("json_update", []).extend(pending)
+        return self._execute_update(self.options.get("data") or {})
+
+    @classmethod
+    def _json_op_specs(cls, column: str, op: Any,
+                       ifnull: Any) -> List[JsonUpdate]:
+        """把单个操作元素解析为若干 :class:`JsonUpdate` 规格。
+
+        与 :meth:`_json_write` 共用同一套语义校验，保证两个入口行为一致：
+        校验都在构造阶段完成，Builder 只负责纯编译。
+        """
+        # 4) JsonUpdate 实例：直接采用（自带列名，可跨列）
+        if isinstance(op, JsonUpdate):
+            if op.mode not in JSON_UPDATE_MODES:
+                raise InvalidArgumentException(
+                    f"不支持的 JSON 写入模式: {op.mode!r}。可选: "
+                    + ", ".join(JSON_UPDATE_MODES))
+            return [op]
+
+        # 3) {路径: 值} 简写 -> set 多路径
+        if isinstance(op, dict):
+            if not op:
+                raise InvalidArgumentException(
+                    "JSON 路径映射不能为空（形如 {'$.a': 1}）")
+            return [JsonUpdate(column, p, v, "set", ifnull)
+                    for p, v in op.items()]
+
+        # 1) / 2) 元组形式
+        if not isinstance(op, (list, tuple)):
+            raise InvalidArgumentException(
+                "update_json_ops 的每个操作须为 (模式, 路径[, 值]) 元组、"
+                f"{{路径: 值}} 映射或 JsonUpdate 实例；收到 {type(op).__name__}")
+        if len(op) < 2:
+            raise InvalidArgumentException(
+                f"操作 {op!r} 至少需要 (模式, 路径) 两个元素")
+
+        mode = op[0]
+        if not (isinstance(mode, str)
+                and mode.strip().lower() in JSON_UPDATE_MODES):
+            raise InvalidArgumentException(
+                f"不支持的 JSON 写入模式: {mode!r}。可选: "
+                + ", ".join(JSON_UPDATE_MODES))
+        mode = mode.strip().lower()
+        path = op[1]
+
+        if mode == "remove":
+            if len(op) > 2:
+                raise InvalidArgumentException(
+                    "remove 操作不接受值（删除无需值）")
+            paths = list(path) if isinstance(path, (list, tuple)) else [path]
+            if not paths:
+                raise InvalidArgumentException("remove 操作至少需要一个路径")
+            return [JsonUpdate(column, p, None, "remove", ifnull)
+                    for p in paths]
+
+        if mode == "patch":
+            # 补丁自带键路径，故只需 (模式, 补丁文档)，无路径元素
+            if len(op) != 2:
+                raise InvalidArgumentException(
+                    "patch 操作的写法为 (模式, 补丁文档)；补丁自带键路径，"
+                    "不要再提供路径元素")
+            patch = op[1]
+            if not isinstance(patch, dict):
+                raise InvalidArgumentException(
+                    "patch 操作的补丁必须是 dict（RFC 7396 文档）")
+            return [JsonUpdate(column, None, patch, "patch", ifnull)]
+
+        if len(op) < 3:
+            raise InvalidArgumentException(
+                f"{mode} 操作需要提供值，写法为 (模式, 路径, 值)")
+
+        value = op[2]
+        if isinstance(path, dict):
+            raise InvalidArgumentException(
+                "set / insert 的路径不应是 dict；多路径请直接以 "
+                "{'$.a': 1, '$.b': 2} 作为一个操作元素，或拆成多条操作")
+        return [JsonUpdate(column, path, value, mode, ifnull)]
 
     def _json_write(self, mode: str, field: str, path: Any,
                     value: Any, ifnull: Any) -> int:

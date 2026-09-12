@@ -49,6 +49,7 @@ dict / Model
 
 ```
 Query.update_json()           # 参数归一化 + 安全校验，不含方言
+Query.update_json_ops()       # 同上，另接受操作列表（v0.7.0，按序折叠）
       │  产出 JsonUpdate(column, path, value, mode, ifnull)
       ▼
 Builder._build_json_update()  # 按列分组 → 相邻同类合并 → 异类按序嵌套
@@ -339,8 +340,42 @@ exists  not exists  contains  not contains
 
 异类操作（如 `set` 与 `remove` 同时出现）折叠为按序左嵌套
 `json_remove(json_set(c, ...), ...)`；左嵌套保证占位符在 SQL 中的出现顺序
-与参数追加顺序严格一致。公共 Query API 下每个终端方法只产生一种操作，
-此路径为 Builder 直接调用者保留（`test_json.py` 有对应用例）。
+与参数追加顺序严格一致。这一路径由公开入口 `update_json_ops()` 直接暴露
+（见 §5.5）。
+
+### 5.5 操作列表与顺序语义（v0.7.0）
+
+`update_json_ops(field, ops)` 把多种操作编译进同一条 UPDATE，**列表顺序即
+应用顺序**（左嵌套折叠的直接结果）：
+
+| 操作列表 | 生成 SET 表达式 | 效果 |
+|---|---|---|
+| `[('set','$.a',1)]` | `json_set(c,'$.a',?)` | 写 `$.a` |
+| `[('set','$.a',1), ('remove','$.a')]` | `json_remove(json_set(c,'$.a',?),'$.a')` | `$.a` 被删除 |
+| `[('remove','$.a'), ('set','$.a',1)]` | `json_set(json_remove(c,'$.a'),'$.a',?)` | `$.a` 保留为 1 |
+| `[('set','$.a',1), ('set','$.b',2)]` | `json_set(c,'$.a',?,'$.b',?)` | 相邻同类合并为一次调用 |
+
+**为什么合并不是纯优化**：SQL 中同列多个 SET 子句只有最后一个生效，拆开
+会静默丢失前面的操作，因此合并是正确性要求。合并不改变语义——SQLite 对
+同一次调用内的重复路径同样是"后者胜"（已实测），与嵌套顺序语义一致。
+
+**操作元素的五种写法**：
+
+| 元素 | 适用模式 | 说明 |
+|---|---|---|
+| `(模式, 路径, 值)` | `set` / `insert` | 通用三元组 |
+| `(模式, 路径)` | `remove` | 路径传 `list` 可一次删多个 |
+| `(模式, 补丁文档)` | `patch` | 补丁自带键路径，无路径元素 |
+| `{路径: 值}` | 等价 `set` | 多路径简写 |
+| `JsonUpdate(col, path, value, mode)` | 任意 | 自带列名 → 一条语句改多个 JSON 列 |
+
+**构造期整体校验**：全部元素先解析，任一非法即抛 `InvalidArgumentException`，
+不执行写入，也不在查询构造器上留下半成品规格（`options["json_update"]`
+保持原样）。因此"部分合法 + 部分非法"的调用不会产生任何副作用。
+
+> 设计取舍：没有引入 `J.set(...)` 之类的操作构造器新类型。元组形式已足够
+> 直白，而 `JsonUpdate` 本就是公开导出的规格对象，直接复用可避免多一层概念；
+> `{路径: 值}` 简写覆盖了最常见的多路径场景。
 
 **空列（SQL NULL）**：`json_set(NULL, ...)` 返回 NULL，更新静默无效。
 默认保持 SQL 语义，需显式传 `ifnull={}`（对象）或 `ifnull=[]`（数组）才兜底。
@@ -394,7 +429,7 @@ exists  not exists  contains  not contains
 
 ## 8. 测试覆盖
 
-`test_json.py`（176 项）。查询与序列化部分（78 项）：
+`test_json.py`（238 项）。查询与序列化部分（78 项）：
 
 | 分组 | 项数 | 覆盖内容 |
 |---|---|---|
@@ -406,7 +441,7 @@ exists  not exists  contains  not contains
 | `TestPathAndSafety` / `TestSafety` | 10 | 路径规范化、注入防护、非法运算符与复合值 |
 | `TestDriverContract` | 5 | NoSQL 恒等、SQLite 表达式形态、能力开关报错 |
 
-路径写入部分（98 项）：
+路径写入部分（160 项）：
 
 | 分组 | 项数 | 覆盖内容 |
 |---|---|---|
@@ -421,18 +456,27 @@ exists  not exists  contains  not contains
 | `TestModelUpdateJson` | 8 | 模型层四种方法的 `where` 写法（dict / 主键 / 闭包）与缺失 where 拒绝 |
 | `TestJsonWriteDriverContract` | 10 | 基类写入扩展点抛错、`json_bind` 包装规则、SQLite 表达式形态、模式白名单、异类操作左嵌套 |
 
+操作列表部分（62 项，v0.7.0 新增）：
+
+| 分组 | 项数 | 覆盖内容 |
+|---|---|---|
+| `TestUpdateJsonOpsMixed` | 12 | 五种元素写法、混合 `set`/`insert`/`remove`/`patch`、容器与布尔保真、`raw()` 表达式 |
+| `TestUpdateJsonOpsOrder` | 8 | 列表顺序即应用顺序（同路径 `set`↔`remove` 对照）、相邻同类合并的"后者胜"语义、多次交替 |
+| `TestUpdateJsonOpsSqlShape` | 8 | 单操作与混合操作的 SQL 形态、左嵌套结构、多路径 `json_remove`、参数顺序、值不被内联、`fetch_sql` 不落库 |
+| `TestUpdateJsonOpsMultiColumn` | 3 | `JsonUpdate` 自带列名 → 一条语句两个 SET 子句、列名优先于 `field` |
+| `TestUpdateJsonOpsSafety` | 19 | 列表与元素类型、非法模式、`patch` 形态、`remove` 带值、路径为 dict、无 where、注入面、**失败不留半成品状态** |
+| `TestUpdateJsonOpsIntegration` | 7 | `where_json` 组合、缓存失效、事务回滚、未命中返回 0、NULL 列（含 `ifnull`）、多行更新 |
+| `TestModelUpdateJsonOps` | 5 | 模型层入口的 `where` 四种写法与 `ifnull` 透传 |
+
 ---
 
 ## 9. 后续可做
 
 1. **`where_json_where` 子集匹配** —— 用 `json_each` 逐键比对实现对象子集查询；
 2. **JSON 表达式索引助手** —— 生成 `CREATE INDEX ... ON t(json_extract(c,'$.k'))` 的 DDL 辅助方法；
-3. **多操作原子写入** —— 当前每个终端方法只产生一种操作；若需要"同列
-   `set` + `remove` 一条语句完成"，可加一个接受操作列表的入口
-   （Builder 的左嵌套逻辑已就绪，见 §5.4）；
-4. **`is null` / `exists` 的写入侧对应** —— 例如"仅当路径不存在时删除"；
-5. **MySQL / PostgreSQL 驱动落地** —— 按 §4.2 / §4.3 的骨架实现并补齐
+3. **`is null` / `exists` 的写入侧对应** —— 例如"仅当路径不存在时删除"；
+4. **MySQL / PostgreSQL 驱动落地** —— 按 §4.2 / §4.3 的骨架实现并补齐
    `_LAZY_DRIVERS` 注册。
 
 > v0.5.0 列在"后续可做"里的 `json_set` / `json_patch` 写入助手已在
-> v0.6.0 落地（§5.4）。
+> v0.6.0 落地（§5.4）；"多操作原子写入"入口已在 v0.7.0 落地（§5.5）。

@@ -99,7 +99,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **结果集与分页** —— `Collection`（`column / where / map / sum / to_json` …）+ `Paginator`
 - **camelCase 别名** —— `whereIn` 自动映射到 `where_in`，PHP/JS 开发者上手无阻
 - **JSON 字段查询** —— `json()` 结果自动格式化为 Python `dict`；`where_json` 家族支持路径条件（比较 / 存在 / 包含 / 长度 / 类型），`field_json` / `order_json` 提取与排序，写入侧自动序列化；SQL 形态由驱动提供，可扩展至 MySQL / MongoDB / Redis
-- **JSON 路径写入** —— `update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch` 在 SQL 内改写嵌套字段，无读改写窗口（并发交错不丢更新），与路径查询对称
+- **JSON 路径写入** —— `update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch` 在 SQL 内改写嵌套字段，无读改写窗口（并发交错不丢更新），与路径查询对称；`update_json_ops` 在一条语句内按序混合多种操作
 - **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
@@ -787,6 +787,59 @@ Db.table('user').where_json('extra', '$.age', '>', 30).update_json(
 | `update_json_insert` | 仅当路径不存在时写入 | `json_insert` |
 | `update_json_remove` | 删除路径（可多个） | `json_remove` |
 | `update_json_patch` | RFC 7396 合并补丁 | `json_patch` |
+| `update_json_ops` | 一条语句内混合多种操作 | 按序折叠成一次调用 |
+
+#### 一条语句内混合多种操作
+
+上面每个方法一次只表达一种操作；`update_json_ops()` 接受操作列表，把多种
+操作编译进**同一条** UPDATE，按列表顺序依次生效：
+
+```python
+Db.table('user').where('id', 1).update_json_ops('extra', [
+    ('set',    '$.age', 19),        # 改值
+    ('remove', '$.tmp'),            # 删键
+    ('insert', '$.level', 'vip'),   # 不存在才写
+    ('patch',  {'meta': {'v': 2}}), # RFC 7396 合并
+    ('remove', ['$.a', '$.b']),     # 一次删多个
+])
+# UPDATE `user` SET `extra` = json_insert(json_patch(json_set(
+#   json_remove(json_set(`extra`, '$.age', ?), '$.tmp'), '$.level', ?),
+#   json(?)), '$.a', ...) WHERE `id` = 1
+```
+
+操作元素支持五种写法：
+
+| 写法 | 适用模式 | 说明 |
+|---|---|---|
+| `(模式, 路径, 值)` | `set` / `insert` | 通用三元组 |
+| `(模式, 路径)` | `remove` | 删除无需值；路径传 `list` 可一次删多个 |
+| `(模式, 补丁文档)` | `patch` | 补丁自带键路径，无路径元素 |
+| `{路径: 值}` | 等价 `set` | 多路径简写 |
+| `JsonUpdate(...)` | 任意 | 高级用法，自带列名 → 一条语句改多个 JSON 列 |
+
+顺序是**确定的**：列表顺序即应用顺序。
+
+```python
+q.update_json_ops('extra', [('set', '$.a', 1), ('remove', '$.a')])  # $.a 被删
+q.update_json_ops('extra', [('remove', '$.a'), ('set', '$.a', 1)])  # $.a == 1
+```
+
+相邻的同类操作会被合并进同一次函数调用（`json_set(col, p1, v1, p2, v2)`）。
+这不是纯粹的性能优化，而是**正确性要求**：SQL 中同一列出现多个 SET 子句时
+只有最后一个生效，拆开会导致静默丢更新。合并不改变语义——SQLite 对同一次
+调用内的重复路径同样是后者胜。
+
+用 `JsonUpdate` 自带列名，可在一条语句内改多个 JSON 列：
+
+```python
+from tinkpyorm import JsonUpdate
+Db.table('user').where('id', 1).update_json_ops('extra', [
+    JsonUpdate('extra', '$.x', 1, 'set'),
+    JsonUpdate('meta',  '$.m', 2, 'set'),
+])
+```
+
+模型层有同名方法：`User.update_json_ops('extra', [...], where={'id': 1})`。
 
 值为 Python 容器时按 JSON 结构写入（`{'job': 'dev'}` 落库为嵌套对象，
 不会被转义成字符串）；`True` / `False` 写入 JSON `true` / `false`，类型保真。
@@ -825,6 +878,9 @@ Db.table('cnt').where('id', 1).update_json('val', '$.n', expr)
    放大与读改写一致。收益在少一次往返、省 Python 侧解析、并发正确性。
 5. 与 `update()` 一样是**终端方法**（立即执行并返回影响行数），不能像
    `where_json()` 那样继续链式拼接。
+6. **操作列表整体校验**：`update_json_ops()` 先解析全部元素，任一元素非法
+   即抛 `InvalidArgumentException`，此时不执行任何写入，也不在查询构造器上
+   留下半成品状态。
 
 模型层可用同名方法，`where` 写法与 `Model.update` 一致：
 
@@ -1415,22 +1471,22 @@ python test_tinkpyorm.py            #  33 项：查询构造 / 写入 / 事务 /
 python test_drivers.py              #   9 项：驱动抽象层（注册表 / 方言钩子）
 python test_cache.py                #  24 项：查询缓存（TTL / 失效 / LRU / 后端替换）
 python test_stream_concurrency.py   #  21 项：流式读取（chunk/cursor）与多线程安全
-python test_json.py                 # 176 项：JSON 读写（序列化 / 路径查询 / 路径写入 / 安全）
+python test_json.py                 # 238 项：JSON 读写（序列化 / 路径查询 / 路径写入 / 安全）
 
 # 冒烟测试（端到端，覆盖全链路 API）
 python smoke_test.py
 
-# README 示例回归测试（169 项，逐条校验本文档中的用法示例）
+# README 示例回归测试（174 项，逐条校验本文档中的用法示例）
 python test_readme_examples.py
 ```
 
-预期输出（合计 263 项单元测试 + 169 项示例）：
+预期输出（合计 325 项单元测试 + 174 项示例）：
 
 ```
 Ran 176 tests in 0.1s
 OK
 ...
-README 示例：通过 169 项，失败 0 项
+README 示例：通过 174 项，失败 0 项
 ```
 
 ---
@@ -1459,9 +1515,9 @@ TinkPyORM/
 ├── test_drivers.py             # 驱动抽象层测试（9 项）
 ├── test_cache.py               # 查询缓存测试（24 项）
 ├── test_stream_concurrency.py  # 流式读取与并发测试（21 项）
-├── test_json.py                # JSON 读写测试（176 项）
+├── test_json.py                # JSON 读写测试（238 项）
 ├── smoke_test.py               # 端到端冒烟测试
-├── test_readme_examples.py     # README 示例回归测试（169 项）
+├── test_readme_examples.py     # README 示例回归测试（174 项）
 ├── benchmark_vs_sqlite3.py     # 与原生 sqlite3 的性能对照基准
 ├── PERFORMANCE.md              # 性能报告与优化记录
 └── README.md
@@ -1488,6 +1544,28 @@ TinkPyORM/
 ---
 
 ## 更新记录
+
+### v0.7.0
+
+**JSON 路径写入的操作列表入口**（一条语句内混合 `set` / `insert` / `remove` / `patch`）：
+
+1. **`Query.update_json_ops(field, ops, ifnull=None)`** —— 接受操作列表，按序折叠
+   进**同一条** UPDATE：`[('set','$.a',1), ('remove','$.b'), ('patch', {...})]`
+   编译为 `json_patch(json_remove(json_set(col,'$.a',?),'$.b'), json(?))`。
+2. **五种操作元素写法** —— `(模式, 路径, 值)`（`set` / `insert`）、
+   `(模式, 路径)`（`remove`，路径传 `list` 可一次删多个）、`(模式, 补丁文档)`
+   （`patch`，补丁自带键路径）、`{路径: 值}`（多路径简写）、`JsonUpdate` 实例
+   （自带列名，可在一条语句内改多个 JSON 列）。模式名大小写不敏感。
+3. **顺序语义确定** —— 列表顺序即应用顺序：`[set, remove]` 与 `[remove, set]`
+   作用于同一路径时结果相反。相邻同类操作合并进同一次函数调用，既避免
+   "同列多个 SET 子句只有最后一个生效"的静默丢更新，也不改变语义
+   （SQLite 对同一次调用内的重复路径同样是后者胜）。
+4. **构造期整体校验** —— 全部元素先解析校验，任一非法即抛
+   `InvalidArgumentException`，不执行写入，也不在查询构造器上留下半成品规格。
+5. **Model 层对称入口** —— `Model.update_json_ops(field, ops, where, ifnull)`，
+   `where` 写法与 `Model.update` 一致（闭包 / dict / 元组 / 主键值）。
+6. **测试与文档** —— `test_json.py` 由 176 项扩至 238 项，合计 325 项单元测试
+   + 174 项 README 示例全量通过；README 新增「一条语句内混合多种操作」小节。
 
 ### v0.6.0
 

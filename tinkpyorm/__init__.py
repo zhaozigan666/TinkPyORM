@@ -48,6 +48,16 @@ JSON 路径级局部更新（v0.6.0）::
     Db.table("user").where("id", 1).update_json_remove("extra", ["$.tmp", "$.cache"])
     Db.table("user").where("id", 1).update_json_patch("extra", {"tmp": None})
 
+一条语句内混合多种操作（v0.7.0）::
+
+    Db.table("user").where("id", 1).update_json_ops("extra", [
+        ("set",    "$.age", 19),        # 改值
+        ("remove", "$.tmp"),            # 删键
+        ("insert", "$.level", "vip"),   # 不存在才写
+        ("patch",  {"meta": {"v": 2}}), # RFC 7396 合并
+        ("remove", ["$.a", "$.b"]),     # 一次删多个
+    ])
+
 在 SQL 内改写嵌套字段，没有"读出 → 改 → 写回"窗口，故并发交错时不会
 丢失更新；值与路径均经校验，值一律参数绑定。
 """
@@ -71,7 +81,7 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 
 __all__ = [

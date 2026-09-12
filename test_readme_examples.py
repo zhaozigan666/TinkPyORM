@@ -501,5 +501,43 @@ ck("模型 update_json_remove（where=闭包）",
                                    where=lambda q: q.where("name", "李四"))
    and "senior" in JDoc.where("name", "李四").find().extra, False)
 
+# ---------- JSON 路径写入：操作列表 ----------
+Db.name("jdoc").insert({"name": "ops", "extra": {"a": 1, "b": 2, "t": [1]}})
+ck("update_json_ops 混合 set + remove",
+   lambda: (Db.name("jdoc").where("name", "ops").update_json_ops(
+                "extra", [("set", "$.a", 9), ("remove", "$.b")]) == 1,
+            Db.name("jdoc").json().where("name", "ops").find()["extra"])
+           == (True, {"a": 9, "t": [1]}),
+   True)
+ck("update_json_ops 五种元素写法",
+   lambda: (Db.name("jdoc").where("name", "ops").update_json_ops("extra", [
+                ("set", "$.c", 3),
+                {"$.d": 4, "$.e": True},
+                ("insert", "$.f", "F"),
+                ("remove", ["$.t"]),
+                ("patch", {"p": {"x": 1}}),
+            ]) == 1,
+            Db.name("jdoc").json().where("name", "ops").find()["extra"])
+           == (True, {"a": 9, "c": 3, "d": 4, "e": True, "f": "F",
+                      "p": {"x": 1}}),
+   True)
+ck("update_json_ops 顺序敏感：set 后 remove",
+   lambda: (Db.name("jdoc").where("name", "ops").update_json_ops(
+                "extra", [("set", "$.k", 1), ("remove", "$.k")]) == 1,
+            "k" in Db.name("jdoc").json().where("name", "ops").find()["extra"])
+           == (True, False),
+   True)
+ck("update_json_ops 顺序敏感：remove 后 set",
+   lambda: (Db.name("jdoc").where("name", "ops").update_json_ops(
+                "extra", [("remove", "$.k"), ("set", "$.k", 2)]) == 1,
+            Db.name("jdoc").json().where("name", "ops").find()["extra"]["k"])
+           == (True, 2),
+   True)
+ck("模型 update_json_ops",
+   lambda: (JDoc.update_json_ops("extra", [("set", "$.m", 1)],
+                                 where={"name": "ops"}) == 1,
+            JDoc.where("name", "ops").find().extra["m"]) == (True, 1),
+   True)
+
 print("\nREADME 示例：通过 %d 项，失败 %d 项" % (ok, fail))
 sys.exit(1 if fail else 0)
