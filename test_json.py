@@ -1301,6 +1301,13 @@ class TestUpdateJsonOpsOrder(JsonWriteTestCase):
             "extra", [("set", "$.newkey", 1), ("set", "$.newkey", 2)])
         self.assertEqual(self.extra("张三")["newkey"], 2)
 
+    def test_same_path_insert_first_wins(self):
+        # json_insert 在同一次调用内按序处理：第一个写入后路径已存在，
+        # 后续不再覆盖，故首个值生效
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("insert", "$.fresh", 1), ("insert", "$.fresh", 2)])
+        self.assertEqual(self.extra("张三")["fresh"], 1)
+
     def test_multiple_alternations_applied_in_order(self):
         Db.table("user").where("name", "张三").update_json_ops("extra", [
             ("set", "$.k", 1), ("remove", "$.k"),
@@ -1308,6 +1315,31 @@ class TestUpdateJsonOpsOrder(JsonWriteTestCase):
             ("set", "$.k", 3),
         ])
         self.assertEqual(self.extra("张三")["k"], 3)
+
+    def test_same_path_expression_uses_original_column_value(self):
+        """同一列表内的值表达式均基于**原始列值**求值。
+
+        相邻同类操作被合并进同一次 ``json_set`` 调用，而 SQL 中的
+        ``json_extract(col, ...)`` 引用的是列本身，不受嵌套层次影响。
+        因此下面两次表达式自增只净增 1（两次读到的都是原值 0）。
+        这是 SQL 表达式求值的固有性质，不是框架缺陷；要真正链式自增
+        必须拆成多条语句（见下一条用例）。
+        """
+        Db.table("user").where("name", "张三").update_json("extra", "$.cnt", 0)
+        expr = raw("json_extract(`extra`, '$.cnt') + 1")
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.cnt", expr), ("set", "$.cnt", expr)])
+        self.assertEqual(self.extra("张三")["cnt"], 1)
+
+    def test_expression_chain_via_separate_statements(self):
+        """每条语句独立执行时，表达式才能读到上一步的结果。"""
+        Db.table("user").where("name", "张三").update_json("extra", "$.cnt", 0)
+        expr = raw("json_extract(`extra`, '$.cnt') + 1")
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.cnt", expr)])
+        Db.table("user").where("name", "张三").update_json_ops(
+            "extra", [("set", "$.cnt", expr)])
+        self.assertEqual(self.extra("张三")["cnt"], 2)
 
 
 class TestUpdateJsonOpsSqlShape(JsonWriteTestCase):

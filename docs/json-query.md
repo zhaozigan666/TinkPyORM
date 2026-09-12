@@ -357,7 +357,20 @@ exists  not exists  contains  not contains
 
 **为什么合并不是纯优化**：SQL 中同列多个 SET 子句只有最后一个生效，拆开
 会静默丢失前面的操作，因此合并是正确性要求。合并不改变语义——SQLite 对
-同一次调用内的重复路径同样是"后者胜"（已实测），与嵌套顺序语义一致。
+同一次调用内的重复路径同样是"后者胜"（`json_insert` 则是首个生效，均已实测），
+与嵌套顺序语义一致。
+
+**值表达式的求值基准（易踩坑）**：`raw()` 表达式引用的是**列**，而 SQL 中的
+列引用不受嵌套层次影响，因此同一语句内的多次写入看到的都是同一个原始列值：
+
+| 写法 | 结果 |
+|---|---|
+| `[('set','$.n',raw("json_extract(col,'$.n')+1"))] * 2`（同一列表） | `n` 净增 **1** |
+| 同上，但分**两条** `update_json_ops` 调用 | `n` 净增 **2** |
+
+实测对比：`json_set(json_set(D,'$.n', json_extract(D,'$.n')+1), '$.n', json_extract(D,'$.n')+1)`
+得到的仍是 `n=1`——外层表达式读的是 `D` 而非内层结果。要表达式级链式，
+必须拆成多条语句（每条独立 UPDATE）。**常量写入不受此限**，顺序语义严格成立。
 
 **操作元素的五种写法**：
 
@@ -429,7 +442,7 @@ exists  not exists  contains  not contains
 
 ## 8. 测试覆盖
 
-`test_json.py`（238 项）。查询与序列化部分（78 项）：
+`test_json.py`（241 项）。查询与序列化部分（78 项）：
 
 | 分组 | 项数 | 覆盖内容 |
 |---|---|---|
@@ -456,12 +469,12 @@ exists  not exists  contains  not contains
 | `TestModelUpdateJson` | 8 | 模型层四种方法的 `where` 写法（dict / 主键 / 闭包）与缺失 where 拒绝 |
 | `TestJsonWriteDriverContract` | 10 | 基类写入扩展点抛错、`json_bind` 包装规则、SQLite 表达式形态、模式白名单、异类操作左嵌套 |
 
-操作列表部分（62 项，v0.7.0 新增）：
+操作列表部分（65 项，v0.7.0 新增）：
 
 | 分组 | 项数 | 覆盖内容 |
 |---|---|---|
 | `TestUpdateJsonOpsMixed` | 12 | 五种元素写法、混合 `set`/`insert`/`remove`/`patch`、容器与布尔保真、`raw()` 表达式 |
-| `TestUpdateJsonOpsOrder` | 8 | 列表顺序即应用顺序（同路径 `set`↔`remove` 对照）、相邻同类合并的"后者胜"语义、多次交替 |
+| `TestUpdateJsonOpsOrder` | 11 | 列表顺序即应用顺序（同路径 `set`↔`remove` 对照）、`set` 后者胜 / `insert` 首个生效、多次交替、**表达式求值基准**与拆分语句的对照 |
 | `TestUpdateJsonOpsSqlShape` | 8 | 单操作与混合操作的 SQL 形态、左嵌套结构、多路径 `json_remove`、参数顺序、值不被内联、`fetch_sql` 不落库 |
 | `TestUpdateJsonOpsMultiColumn` | 3 | `JsonUpdate` 自带列名 → 一条语句两个 SET 子句、列名优先于 `field` |
 | `TestUpdateJsonOpsSafety` | 19 | 列表与元素类型、非法模式、`patch` 形态、`remove` 带值、路径为 dict、无 where、注入面、**失败不留半成品状态** |

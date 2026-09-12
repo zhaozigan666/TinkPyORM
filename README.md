@@ -827,7 +827,28 @@ q.update_json_ops('extra', [('remove', '$.a'), ('set', '$.a', 1)])  # $.a == 1
 相邻的同类操作会被合并进同一次函数调用（`json_set(col, p1, v1, p2, v2)`）。
 这不是纯粹的性能优化，而是**正确性要求**：SQL 中同一列出现多个 SET 子句时
 只有最后一个生效，拆开会导致静默丢更新。合并不改变语义——SQLite 对同一次
-调用内的重复路径同样是后者胜。
+调用内的重复路径同样是后者胜（`json_insert` 则是首个生效）。
+
+> **值表达式的求值基准**：`raw()` 表达式引用的是**列本身**
+> （如 `json_extract(\`extra\`, '$.n')`），因此同一条语句内的多次写入看到的
+> 都是同一个原始列值——即使 ORM 把它们嵌套成
+> `json_set(json_set(col, ...), ...)` 也一样。下面两次自增只净增 1：
+>
+> ```python
+> expr = raw("json_extract(`extra`, '$.n') + 1")
+> q.update_json_ops('extra', [('set', '$.n', expr), ('set', '$.n', expr)])  # n += 1
+> ```
+>
+> 要链式引用上一步的结果，必须拆成多条语句（每条独立 UPDATE 才能读到上一次
+> 的落库值）：
+>
+> ```python
+> q.update_json_ops('extra', [('set', '$.n', expr)])
+> q.update_json_ops('extra', [('set', '$.n', expr)])   # n += 2
+> ```
+>
+> 这是 SQL 表达式的固有性质，不是框架限制。**常量**写入不受影响，
+> 顺序语义严格成立。
 
 用 `JsonUpdate` 自带列名，可在一条语句内改多个 JSON 列：
 
@@ -1471,7 +1492,7 @@ python test_tinkpyorm.py            #  33 项：查询构造 / 写入 / 事务 /
 python test_drivers.py              #   9 项：驱动抽象层（注册表 / 方言钩子）
 python test_cache.py                #  24 项：查询缓存（TTL / 失效 / LRU / 后端替换）
 python test_stream_concurrency.py   #  21 项：流式读取（chunk/cursor）与多线程安全
-python test_json.py                 # 238 项：JSON 读写（序列化 / 路径查询 / 路径写入 / 安全）
+python test_json.py                 # 241 项：JSON 读写（序列化 / 路径查询 / 路径写入 / 安全）
 
 # 冒烟测试（端到端，覆盖全链路 API）
 python smoke_test.py
@@ -1480,7 +1501,7 @@ python smoke_test.py
 python test_readme_examples.py
 ```
 
-预期输出（合计 325 项单元测试 + 174 项示例）：
+预期输出（合计 328 项单元测试 + 174 项示例）：
 
 ```
 Ran 176 tests in 0.1s
@@ -1515,7 +1536,7 @@ TinkPyORM/
 ├── test_drivers.py             # 驱动抽象层测试（9 项）
 ├── test_cache.py               # 查询缓存测试（24 项）
 ├── test_stream_concurrency.py  # 流式读取与并发测试（21 项）
-├── test_json.py                # JSON 读写测试（238 项）
+├── test_json.py                # JSON 读写测试（241 项）
 ├── smoke_test.py               # 端到端冒烟测试
 ├── test_readme_examples.py     # README 示例回归测试（174 项）
 ├── benchmark_vs_sqlite3.py     # 与原生 sqlite3 的性能对照基准
@@ -1564,7 +1585,12 @@ TinkPyORM/
    `InvalidArgumentException`，不执行写入，也不在查询构造器上留下半成品规格。
 5. **Model 层对称入口** —— `Model.update_json_ops(field, ops, where, ifnull)`，
    `where` 写法与 `Model.update` 一致（闭包 / dict / 元组 / 主键值）。
-6. **测试与文档** —— `test_json.py` 由 176 项扩至 238 项，合计 325 项单元测试
+6. **表达式求值基准（易踩坑，已文档化）** —— `raw()` 表达式引用的是**列本身**，
+   同一语句内的多次写入看到的都是同一个原始列值。因此同一列表内写两次
+   `json_extract(col,'$.n') + 1` 只净增 1（嵌套成
+   `json_set(json_set(...), ...)` 也改变不了，外层读的仍是原列）；要链式
+   引用上一步结果必须拆成多条语句。常量写入不受此限，顺序语义严格成立。
+7. **测试与文档** —— `test_json.py` 由 176 项扩至 241 项，合计 328 项单元测试
    + 174 项 README 示例全量通过；README 新增「一条语句内混合多种操作」小节。
 
 ### v0.6.0
