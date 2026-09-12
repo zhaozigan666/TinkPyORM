@@ -200,219 +200,111 @@ User.destroy(user.id)                                  # 删除
 
 ### v0.7.1
 
-**修复：`type` 校验与驱动注册表脱节，自定义驱动无法配置**（破坏"新增数据库只需
-实现驱动并注册"的扩展承诺）：
+`type` 校验修复；文档重组并发布到 GitHub Wiki。
 
-1. **根因** —— `config.normalize_type()` 只对照静态白名单 `KNOWN_TYPES`
-   （由内置别名表 `TYPE_ALIASES` 派生）判定合法性，与 `drivers._DRIVERS`
-   活注册表**完全脱节**。于是 `register_driver("oracle", OracleDriver)` 之后
-   `{"type": "oracle"}` 仍被 `Config` 拒绝，扩展路径在配置层即断裂。此前测试
-   只能用 `object.__new__(Config)` 绕过校验构造配置，是这一缺陷的直接症状。
-2. **修复** —— 校验改为"先查内置保留名（快路径、零导入），未命中再查活驱动
-   注册表"。`drivers/base.py` 反向依赖 `config`（`from ..config import Config`），
-   故注册表查询必须**惰性导入**，否则形成循环导入；驱动层抛错时退化为内置集合，
-   不连带阻断配置构造。注册表查询不缓存——注册动作之后立即生效。
-3. **新增 `available_type_names()`** —— 返回当前可配置的类型名（内置保留名 ∪
-   已注册驱动名），并从包顶层导出，便于排查"为何我的 type 被拒"。
-4. **错误信息可执行化** —— 未注册类型改为列出**活注册表**清单并给出
-   `register_driver('名字', YourDriver)` 的注册指引。
-5. **边界保持不变** —— 别名解析（`mariadb` → `mysql`）与"预留名"语义不变：
-   `mysql` / `postgresql` / `mssql` / `mongodb` / `redis` 配置阶段放行，到建立
-   连接时才因缺少驱动实现抛 `DriverNotAvailable`。
-6. **测试** —— `test_drivers.py` 由 9 项扩至 16 项：新增 `TestCustomDriverConfig`
-   覆盖自定义驱动的配置构造、`from_dict`、`Db.set_config` 端到端真实查询、
-   别名解析、预留名边界、未注册拒绝、注册表非缓存；同时移除既有用例中的
-   `object.__new__(Config)` 绕过写法，改为走真实构造路径。合计 335 项单元测试
-   + 174 项 README 示例全量通过。
-7. **文档重组** —— README 由 1847 行精简至 473 行，只保留门面信息（简介 / 特性 /
-   零依赖 / 安装 / 快速开始 / 文档导航 / 更新记录 / 致谢 / 许可证）；技术章节按
-   主题拆分到 [`wiki/`](wiki/Home.md) 共 25 页，每页带「上一页 / 下一页 / 返回索引」
-   导航。拆分经**多重集校验**：67 个代码块前后完全一致（零丢失、零改写），
-   正文仅有的差异是目录改写与一处刻意修正的相对链接。设计文档仍在 `docs/`，
-   性能数据仍在 `PERFORMANCE.md`。技术文档另经 `scripts/sync_wiki.py` 发布到
-   [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)——自动改写链接
-   （页面名去扩展名、仓库内文件转绝对 URL）、按索引生成侧边栏，并做零丢失校验。
+- `type` 校验改为对照活驱动注册表，`register_driver()` 注册的类型可正常配置
+- 新增并导出 `available_type_names()`
+- 未注册类型的报错列出全部可配置类型与 `register_driver()` 用法
+- 别名解析与保留名行为不变：`mariadb` → `mysql`；`mysql` / `postgresql` / `mssql` / `mongodb` / `redis` 配置放行、连接时报 `DriverNotAvailable`
+- `test_drivers.py` 9 → 16 项，新增 `TestCustomDriverConfig`；合计 335 项单元测试 + 174 项示例通过
+- README 精简为门面文档，技术章节拆分为 [`wiki/`](wiki/Home.md) 共 25 页
+- 新增 `scripts/sync_wiki.py`，技术文档发布至 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)
+
 ### v0.7.0
 
-**JSON 路径写入的操作列表入口**（一条语句内混合 `set` / `insert` / `remove` / `patch`）：
+一条语句内混合多种 JSON 操作。
 
-1. **`Query.update_json_ops(field, ops, ifnull=None)`** —— 接受操作列表，按序折叠
-   进**同一条** UPDATE：`[('set','$.a',1), ('remove','$.b'), ('patch', {...})]`
-   编译为 `json_patch(json_remove(json_set(col,'$.a',?),'$.b'), json(?))`。
-2. **五种操作元素写法** —— `(模式, 路径, 值)`（`set` / `insert`）、
-   `(模式, 路径)`（`remove`，路径传 `list` 可一次删多个）、`(模式, 补丁文档)`
-   （`patch`，补丁自带键路径）、`{路径: 值}`（多路径简写）、`JsonUpdate` 实例
-   （自带列名，可在一条语句内改多个 JSON 列）。模式名大小写不敏感。
-3. **顺序语义确定** —— 列表顺序即应用顺序：`[set, remove]` 与 `[remove, set]`
-   作用于同一路径时结果相反。相邻同类操作合并进同一次函数调用，既避免
-   "同列多个 SET 子句只有最后一个生效"的静默丢更新，也不改变语义
-   （SQLite 对同一次调用内的重复路径同样是后者胜）。
-4. **构造期整体校验** —— 全部元素先解析校验，任一非法即抛
-   `InvalidArgumentException`，不执行写入，也不在查询构造器上留下半成品规格。
-5. **Model 层对称入口** —— `Model.update_json_ops(field, ops, where, ifnull)`，
-   `where` 写法与 `Model.update` 一致（闭包 / dict / 元组 / 主键值）。
-6. **表达式求值基准（易踩坑，已文档化）** —— `raw()` 表达式引用的是**列本身**，
-   同一语句内的多次写入看到的都是同一个原始列值。因此同一列表内写两次
-   `json_extract(col,'$.n') + 1` 只净增 1（嵌套成
-   `json_set(json_set(...), ...)` 也改变不了，外层读的仍是原列）；要链式
-   引用上一步结果必须拆成多条语句。常量写入不受此限，顺序语义严格成立。
-7. **测试与文档** —— `test_json.py` 由 176 项扩至 241 项，合计 328 项单元测试
-   + 174 项 README 示例全量通过；README 新增「一条语句内混合多种操作」小节。
+- 新增 `Query.update_json_ops(field, ops, ifnull=None)` 与 `Model.update_json_ops(...)`
+- 支持五种操作元素：`(模式, 路径, 值)`、`(模式, 路径)`、`(模式, 补丁)`、`{路径: 值}`、`JsonUpdate` 实例；模式名大小写不敏感
+- 列表顺序即应用顺序；相邻同类操作合并进同一次函数调用
+- 全部元素在构造期校验，非法即抛 `InvalidArgumentException`
+- 同一条语句内多次写入引用的是原始列值，链式引用需拆成多条语句
+- `test_json.py` 176 → 241 项；合计 328 项单元测试 + 174 项示例通过
+- 文档新增「一条语句内混合多种操作」小节
 
 ### v0.6.0
 
-**JSON 路径写入（局部更新）**——补齐与路径查询对称的写入侧能力，形成
-"写入序列化 → 路径查询 → 路径写入 → 结果解码"的完整闭环：
+JSON 路径级局部更新。
 
-1. **驱动层新增写入扩展点** —— `Driver` 增加 `json_set` / `json_insert` /
-   `json_remove` / `json_patch` / `json_bind`；`SQLiteDriver` 给出完整参考实现。
-   `json_bind` 解决两个必须包装的场景：容器值若不包 `json(?)` 会被存成
-   **转义字符串**；布尔若直接绑定会被 sqlite3 适配成整数 1/0，丢失 JSON 类型
-   （现按 JSON 文本 `'true'` / `'false'` 绑定，`json_type` 报 `true` / `false`）。
-2. **Query 新增四个终端方法** —— `update_json`（`json_set`，存在覆盖、不存在
-   新增）/ `update_json_insert`（`json_insert`，不覆盖已有值）/
-   `update_json_remove`（`json_remove`，支持多路径）/
-   `update_json_patch`（`json_patch`，RFC 7396）。均支持 `where` 条件组合、
-   `fetch_sql`、缓存自动失效、事务回滚。
-3. **多路径原子写入** —— `update_json(field, {'$.a': 1, '$.b': 2})` 编译为
-   **一次** `json_set` 调用。这是正确性要求而非优化：SQL 中同一列出现多个
-   SET 子句时只有最后一个生效，拆开会导致静默丢更新。
-4. **空列兜底 `ifnull`** —— `json_set(NULL, ...)` 返回 NULL（更新静默无效），
-   传 `ifnull={}` / `[]` 令驱动编译为 `COALESCE(col, '{}')`。兜底文档是常量
-   字面量，不引入绑定参数、无注入面。
-5. **Model 层入口** —— `Model.update_json` 族，`where` 写法与 `Model.update`
-   一致（闭包 / dict / 元组 / 主键值）。抽出 `_apply_where` 供两者复用。
-6. **安全** —— 列名、路径、`ifnull` 三重校验；值一律绑定（含容器与布尔，
-   以 JSON 文本绑定后由 `json(?)` 解析）；同字段同时出现在普通更新数据与路径
-   写入中直接抛 `QueryError`。
-7. **顺带清理** —— `builder.py` 中 `RawWhere` 重复定义（后定义覆盖前者）已删除；
-   `_UNSET` 哨兵统一下沉到 `utils.UNSET` 供 Model 层复用；`Driver.json_encode`
-   支持 `tuple`（底层驱动无法绑定元组，原行为是晦涩的绑定错误）。
-8. **测试与文档** —— `test_json.py` 由 78 项扩至 176 项，合计 263 项单元测试
-   + 169 项 README 示例全量通过；README 新增「路径级局部更新」；新增
-   `docs/json-query.md` 写入侧章节；`PERFORMANCE.md` 新增第十二节（实测差异
-   与并发丢更新对照）。
+- 驱动层新增 `json_set` / `json_insert` / `json_remove` / `json_patch` / `json_bind`
+- 新增 `Query.update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch`，及 `Model` 层同名方法
+- 多路径写入编译为单次 `json_set` 调用
+- 新增 `ifnull={}` / `[]`，列为空时编译为 `COALESCE(col, '{}')`
+- 列名、路径、`ifnull` 三重校验；值一律绑定（含容器与布尔）
+- 同字段同时出现在普通更新数据与路径写入中抛 `QueryError`
+- 删除 `builder.py` 中重复的 `RawWhere` 定义；`_UNSET` 下沉为 `utils.UNSET`；`Driver.json_encode` 支持 `tuple`
+- `test_json.py` 78 → 176 项；合计 263 项单元测试 + 169 项示例通过
+- 新增 `docs/json-query.md` 写入侧章节；`PERFORMANCE.md` 新增第十二节
 
 ### v0.5.0
 
-**JSON 字段查询与自动格式化**（写入自动序列化 → 路径条件查询 → 结果自动解码闭环）：
+JSON 字段查询与结果自动格式化。
 
-1. **驱动层 JSON 能力契约** —— `Driver` 新增 `supports_json` 与 `json_extract` /
-   `json_exists` / `json_contains` / `json_length` / `json_type` / `json_decode` /
-   `json_encode` 七个扩展点；`SQLiteDriver` 给出完整参考实现（`json_extract` /
-   `json_each` / `json_type`）；`NoSQLDriver` 覆写编解码为**恒等透传**，
-   使 MongoDB / Redis 复用同一条"结果格式化为 dict"的代码路径。
-   路径经 `normalize_json_path()` 白名单校验后内联，杜绝路径注入。
-2. **写入自动序列化** —— `insert` / `insert_all` / `update` 遇 `dict` / `list` 值
-   自动编码为 JSON 文本（走驱动 `json_encode`，保持方言无关），
-   不再需要手动 `json.dumps`。
-3. **结果自动格式化** —— `json()` 支持三档：无参自动嗅探、`json([...])` 指定字段
-   （零嗅探开销）、`json(False)` 关闭；覆盖 `find / select / value / column /
-   chunk / cursor / paginate` 与模型属性；模型声明 `__json__` 后查询自动接入，
-   `_deserialize` 对已解码的 dict / list 幂等返回。
-4. **JSON 路径条件** —— 新增 `where_json` / `where_json_or` / `where_json_null` /
-   `where_json_not_null` / `where_json_exists` / `where_json_not_exists` /
-   `where_json_contains` / `where_json_not_contains` / `where_json_length` /
-   `where_json_type`，以及 `field_json` / `order_json`。新增 `JsonWhere` 条件对象，
-   由 Builder 在编译期向驱动取方言表达式，Query 层不含任何方言知识。
-5. **安全与边界** —— 路径、列名、别名三重白名单校验（`InvalidArgumentException`）；
-   `dict` / `list` 直接比较显式报错并引导到正确 API；不支持的驱动抛
-   `UnsupportedOperation` 而非静默生成错误 SQL。
-6. **测试与文档** —— 新增 `test_json.py`（78 项），合计 292 项测试全量通过；
-   README 新增「JSON 字段查询」章节，新增 `docs/json-query.md`（设计说明 +
-   MySQL / PostgreSQL / MongoDB / Redis 扩展映射）。
+- 驱动层新增 `supports_json` 与 `json_extract` / `json_exists` / `json_contains` / `json_length` / `json_type` / `json_decode` / `json_encode` 七个扩展点
+- `insert` / `insert_all` / `update` 遇 `dict` / `list` 值自动序列化为 JSON
+- `json()` 三档：自动嗅探、`json([...])` 指定字段、`json(False)` 关闭；覆盖 `find` / `select` / `value` / `column` / `chunk` / `cursor` / `paginate` 与模型属性
+- 模型声明 `__json__` 后查询自动接入
+- 新增 `where_json` 家族 10 个条件方法与 `field_json` / `order_json`
+- 路径、列名、别名三重白名单校验；`dict` / `list` 直接比较显式报错；不支持的驱动抛 `UnsupportedOperation`
+- 新增 `test_json.py`（78 项）；合计 292 项测试通过
+- 新增 `docs/json-query.md`；文档新增「JSON 字段查询」章节
 
 ### v0.4.0
 
-**查询缓存重做 + 流式读取 + 连接级线程安全**（依能力评估结论落地：P0 两项 + P1 一项）：
+查询缓存重做、流式读取、连接级线程安全。
 
-1. **查询缓存真正可用** —— 此前 `_cache_store` 挂在 Query 实例上，而 `Db.name()` 每次都
-   新建 Query，导致缓存**从不命中**。新增 `tinkpyorm/cache.py`：进程级单例 + TTL +
-   LRU 容量上限（默认 500 条）+ `RLock` 线程安全 + 可替换后端
-   （`CacheStore` / `MemoryCacheStore` / `cache.set_store()`）。
-2. **`cache(秒)` 语义** —— 第一个参数即"倒计时秒数"：`cache(10)` 表示 10 秒后失效；
-   `cache(0)` 不缓存；仍兼容旧签名 `cache(key, expire)`。缓存范围从仅 `select` 扩展到
-   `find / select / value / column / count / sum / avg / max / min / paginate`。
-3. **写操作自动失效与结果隔离** —— `insert / insert_all / update / delete` 按"库 + 表"
-   前缀清除缓存，裸 SQL 提供 `Db.clear_cache()`；缓存键改为 MD5 摘要（键长恒定），
-   命中时返回副本，修改返回值不再污染缓存。
-4. **连接级线程安全** —— `Connection` 内置可重入锁，串行化 SQL 执行与事务，修复多线程
-   共享同一连接时 `_in_transaction` / `_savepoint_depth` 被交叉覆盖导致的事务语义错乱；
-   `Connection(..., thread_safe=False)` 可关闭锁（单线程省开销）。
-5. **流式读取** —— 新增 `Query.chunk(size)`（分块、每批持锁、线程安全）与
-   `Query.cursor(chunk_size)`（底层 `fetchmany` 真流式、内存恒定）；驱动层新增
-   `Driver.select_stream()`（默认整体分块，SQLite 覆写为真流式）与 `Connection.query_stream()`。
-6. **测试与文档** —— 新增 `test_cache.py`（24 项）、`test_stream_concurrency.py`（21 项），
-   合计 33 + 9 + 24 + 21 项单元测试与 127 项 README 示例全量通过；README 新增
-   「查询缓存」「流式读取」「多线程使用」三节，并修正已知限制中的缓存描述。
+- 新增 `tinkpyorm/cache.py`：进程级缓存 + TTL + LRU（默认 500 条）+ `RLock` + 可替换后端
+- 查询缓存改为 `cache(秒)` 语义，缓存范围扩展至 `find` / `select` / `value` / `column` / `count` / `sum` / `avg` / `max` / `min` / `paginate`
+- 写操作按"库 + 表"前缀清缓存；缓存键改为 MD5 摘要；命中时返回副本
+- `Connection` 内置可重入锁，串行化 SQL 执行与事务；`Connection(..., thread_safe=False)` 可关闭
+- 新增 `Query.chunk(size)` 与 `Query.cursor(chunk_size)`；驱动层新增 `Driver.select_stream()`，连接层新增 `Connection.query_stream()`
+- 新增 `test_cache.py`（24 项）、`test_stream_concurrency.py`（21 项）；合计 87 项单元测试 + 127 项示例通过
+- 文档新增「查询缓存」「流式读取」「多线程使用」三节
 
 ### v0.3.1
 
-**撤销 v0.3.0 的集中式配置机制，保留驱动抽象层**（依使用反馈：集中式配置对单库
-SQLite 场景过于复杂）：
+撤销集中式配置，保留驱动抽象层。
 
-1. **配置入口收敛回 `Db.set_config`** —— 移除 `Config` / `DatabaseManager` / `manager` /
-   包级 `configure()` / `connection()` 以及 DSN / 环境变量 / 配置文件四种来源；
-   `Db._connections` 恢复为唯一状态源，任意模块调用一次 `Db.set_config({...})` 即全局共享，
-   用法与 v0.2.0 完全一致。
-2. **保留并独立 `tinkpyorm.drivers` 驱动抽象层** —— `Connection` 委派 `Driver`、
-   `Builder`/`Query` 方言下沉（`placeholder()` / `quote_identifier()` / `limit_sql()`）
-   全部保留；`config.py` 裁剪为内部值对象（不再导出），删除 `manager.py`。
-3. **保留的修复性行为** —— 未知 `type` 立即报错、未知键归入驱动 options 不再透传
-   `sqlite3.connect()`、SQL 日志上限与开关、`insert_all` 自动分批、`find()` 快路径、
-   `journal_mode` 配置。默认连接未配置时仍回退匿名内存库（v0.2.0 兼容行为）。
-4. **兼容性** —— `Db.set_config` / `Connection()` 旧写法零改动；33 项既有测试 +
-   9 项驱动层测试 + 112 项 README 示例全量通过。公开 API 移除项：`Config`、
-   `DatabaseManager`、`configure()`、`connection()`、`parse_dsn`、`load_file`、
-   `ConfigError`、`ConnectionNotFound`。
+- 配置入口收敛回 `Db.set_config`；移除 `Config` / `DatabaseManager` / `manager` / 包级 `configure()` / `connection()`，以及 DSN / 环境变量 / 配置文件四种来源
+- 保留 `tinkpyorm.drivers` 驱动抽象层；`config.py` 裁剪为内部值对象（不再导出）；删除 `manager.py`
+- 保留未知 `type` 报错、未知键归入驱动 options、SQL 日志上限与开关、`insert_all` 自动分批、`find()` 快路径、`journal_mode` 配置
+- 移除的公开 API：`Config`、`DatabaseManager`、`configure()`、`connection()`、`parse_dsn`、`load_file`、`ConfigError`、`ConnectionNotFound`
+- `Db.set_config` / `Connection()` 旧写法零改动；33 项既有测试 + 9 项驱动层测试 + 112 项示例通过
 
 ### v0.3.0
 
-**架构：集中式配置 + 驱动抽象层**（详见 `docs/config-and-driver-refactor.md`）：
+集中式配置与驱动抽象层。
 
-1. **`Config` + `DatabaseManager` 集中式配置** —— 修复 `Db.set_config` 时代"双状态不同步"的根因
-   （`Db._connections` 与 `connection._default_connection` 两套独立状态未注册时静默回退内存库）。
-   新增 `Config`（dict / DSN / env / file 四种来源）、`DatabaseManager`（命名注册 + 懒连接），
-   推荐在应用启动时调用一次 `tinkpyorm.configure({...})`，之后任意模块直接 `Db.table(...)` /
-   `tinkpyorm.connection()` 共享。
-2. **驱动抽象层 `tinkpyorm.drivers`** —— 把 SQL 方言（占位符 `?` / `%s` / `:1`、标识符引用
-   `` `x` `` / `"x"` / `[x]`、`LIMIT n OFFSET m`）下沉到 `Driver` 接口，新增数据库类型时只需
-   实现一份驱动 + 注册，无需改动 `Connection` / `Builder` / `Query` / `Model`。`Builder`
-   中 5 处硬编码 `?` 和 LIMIT 全部走 `driver.placeholder()` 与 `driver.limit_sql()`；
-4. **`Query` 延迟解析连接** —— `Db.table(...)` 不再要求 `configure()` 已先调用；Query 句柄
-   可先建，配置后置仍生效，消除导入顺序敏感。
-5. **公开 API 零变更** —— `Db.set_config` 降级为兼容包装，33 项既有测试 + 48 项配置层新测
-   + 9 项驱动层新测 + 112 项 README 示例全量通过。
+- 新增 `Config`（dict / DSN / env / file 四种来源）与 `DatabaseManager`（命名注册 + 懒连接）
+- 新增包级 `configure()` 与 `connection()`
+- 新增 `tinkpyorm.drivers` 驱动抽象层，SQL 方言（占位符、标识符引用、分页）下沉至 `Driver`
+- `Query` 延迟解析连接，`Db.table(...)` 不再要求先调用 `configure()`
+- 公开 API 零变更；`Db.set_config` 降级为兼容包装
+- 33 项既有测试 + 48 项配置层新测 + 9 项驱动层新测 + 112 项示例通过
+- 新增 `docs/config-and-driver-refactor.md`
 
 ### v0.2.0
 
-健壮性与性能（基于与原生 sqlite3 的 15 场景基准评估，详见 `PERFORMANCE.md`）：
+健壮性与性能。
 
-1. **`insert_all` 自动分批（修复严重缺陷）** —— 超过 SQLite 绑定变量上限（32766，6 列表约
-   5461 行）的批量插入此前会抛 `too many SQL variables` 崩溃；现按 `32766 // 列数` 自动分批，
-   并在同一事务内完成保证原子性（嵌套事务退化为 SAVEPOINT，语义不变）。可用
-   `batch_size` 显式控制每批行数。
-2. **SQL 日志加上限与开关（修复内存无限增长）** —— 默认仅保留最近 1000 条（环形裁剪），
-   新增 `sql_log_enable(max_size=...)` / `sql_log_disable()` 与配置项 `sql_log_max`
-   （`None` 表示不限制，兼容旧行为）。
-3. **`journal_mode` 连接配置** —— `Db.set_config({"database": ..., "journal_mode": "WAL"})`
-   在连接建立后自动执行对应 PRAGMA（内存库跳过），一行开启 WAL 等写优化。
-4. **`find()` 单行快路径** —— 纯表查询（无模型/无 json/attr/filter/with 后处理）直接返回
-   首行，跳过结果集包装与二次拷贝，主键点查 ORM 开销更低。
+- `insert_all` 超过绑定变量上限时自动分批（可用 `batch_size` 控制），同一事务内保证原子性
+- SQL 日志默认保留最近 1000 条；新增 `sql_log_enable(max_size=...)` / `sql_log_disable()` 与配置项 `sql_log_max`
+- 新增 `journal_mode` 连接配置项，连接建立后自动执行对应 PRAGMA（内存库跳过）
+- `find()` 纯表查询走单行快路径，跳过结果集包装
 
 ### v0.1.1
 
-行为修正（均为对齐 think-orm 语义的 bug 修复）：
+行为修正。
 
-1. **修改器 `set_xxx_attr` 现在对构造数据生效** —— 此前仅在属性赋值时触发，`create()` / `Model(**kwargs)` 传入的数据会绕过修改器直接入库。现已统一走 `set_attr`，`create({"name": "  alice  "})` 可正确触发 `strip` 等加工。从数据库读取仍走 `_from_data`，不会二次加工（例如密码哈希不会被执行两遍）。
-2. **查询范围可在链式任意位置、任意多个串联** —— 此前只能在模型类上作入口调用一次（`User.active()`），`User.where(...).active()` 会抛 `AttributeError`。现 `Query` 在绑定模型时可解析 `scope_xxx`，两种定义风格（实例方法 / `@classmethod`）均支持。
-3. **模型 `__prefix__` 生效** —— 此前显式设置 `__table__` 时前缀被忽略，现 `Model.query()` 改用 `name()` 拼前缀（前缀为空时行为不变）。
-4. **`to_json()` 支持日期类型** —— 内置 `default=str`，`date` / `datetime` / `time` 类型转换字段序列化为 ISO 字符串，不再抛 `TypeError`。
-5. 新增 `union_all()`（对应 think-orm 的 `unionAll`）。
+- 修改器 `set_xxx_attr` 对 `create()` / `Model(**kwargs)` 构造数据生效
+- 查询范围可在链式任意位置、任意多个串联；实例方法与 `@classmethod` 两种定义均支持
+- 显式设置 `__table__` 时 `__prefix__` 生效
+- `to_json()` 内置 `default=str`，`date` / `datetime` / `time` 序列化为 ISO 字符串
+- 新增 `union_all()`（对应 think-orm 的 `unionAll`）
 
 ### v0.1.0
 
-首个可用版本：查询构造器、模型、关联、软删除、事务、分页等完整能力。
+首个可用版本：查询构造器、模型、关联、软删除、事务、分页。
 
 ---
 
