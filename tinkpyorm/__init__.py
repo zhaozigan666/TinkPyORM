@@ -61,6 +61,18 @@ JSON 路径级局部更新（v0.6.0）::
 在 SQL 内改写嵌套字段，没有"读出 → 改 → 写回"窗口，故并发交错时不会
 丢失更新；值与路径均经校验，值一律参数绑定。
 
+文档集合（v0.8.0）—— 无需提前建表与声明字段的 schemaless 文档存储::
+
+    docs = Db.collection("users")
+    uid = docs.insert({"name": "张三", "age": 25,
+                       "profile": {"city": "北京"}, "tags": ["vip"]})
+    docs.find(uid)
+    docs.where("profile.city", "=", "北京").where("age", ">=", 18).select()
+    docs.where("tags", "contains", "vip").order("age", "desc").limit(10).select()
+    docs.where("_id", uid).update_path({"age": 26})     # 路径级局部更新
+    docs.promote("age")          # 提升为生成列，可建普通索引
+    docs.ensure_index("profile.city")   # 其余字段建表达式索引
+
 扩展新数据库（v0.7.1 起配置层跟上注册表）::
 
     from tinkpyorm import register_driver, available_type_names, SQLDriver
@@ -81,6 +93,7 @@ from .collection import Collection, Paginator
 from .config import available_type_names
 from .connection import Connection
 from .db import Db
+from .document import DocumentCollection
 from .drivers import (
     Driver, SQLDriver, NoSQLDriver, SQLiteDriver,
     UnsupportedOperation, register_driver, get_driver, available_drivers,
@@ -96,11 +109,12 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.7.1"
+__version__ = "0.8.0"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
+    "DocumentCollection",
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore",
     "JsonWhere", "JsonUpdate", "JSON_OPS", "JSON_UPDATE_MODES",

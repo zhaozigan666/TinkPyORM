@@ -52,6 +52,7 @@ COMMON_KEYS = frozenset({
     "name", "type", "driver", "database", "dsn", "prefix",
     "host", "port", "user", "username", "password", "options",
     "sql_log_enabled", "sql_log_max", "connect_timeout", "path_expand",
+    "collection_schema_mode",
 })
 
 #: 可直接透传给 sqlite3.connect() 的参数白名单
@@ -61,7 +62,8 @@ SQLITE_CONNECT_KEYS = frozenset({
 })
 
 #: 布尔字段（from_dict 的字符串转换）
-_BOOL_FIELDS = frozenset({"sql_log_enabled", "path_expand"})
+_BOOL_FIELDS = frozenset({"sql_log_enabled", "path_expand",
+                          "collection_schema_mode"})
 _INT_FIELDS = frozenset({"port", "sql_log_max"})
 _FLOAT_FIELDS = frozenset({"connect_timeout"})
 
@@ -153,6 +155,9 @@ class Config:
     sql_log_max: Optional[int] = 1000
     connect_timeout: Optional[float] = None
     path_expand: bool = True
+    #: 文档集合（DocumentCollection）写入期 schema 校验开关（v0.8.0）。
+    #: 开启时对已声明路径上的值做类型校验；关闭时 schema 声明仅作文档。
+    collection_schema_mode: bool = False
 
     def __post_init__(self) -> None:
         self.type = normalize_type(self.type)
@@ -165,6 +170,7 @@ class Config:
             self.connect_timeout = float(self.connect_timeout)
         self.sql_log_enabled = _to_bool(self.sql_log_enabled)
         self.path_expand = _to_bool(self.path_expand)
+        self.collection_schema_mode = _to_bool(self.collection_schema_mode)
         self.options = dict(self.options or {})
         if self.path_expand:
             self.database = self._expand_path(self.database)
@@ -214,6 +220,7 @@ class Config:
             "sql_log_max": self.sql_log_max,
             "connect_timeout": self.connect_timeout,
             "path_expand": self.path_expand,
+            "collection_schema_mode": self.collection_schema_mode,
         }
         for key in ("host", "port", "user", "password"):
             value = getattr(self, key)

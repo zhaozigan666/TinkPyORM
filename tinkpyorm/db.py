@@ -13,7 +13,7 @@ v0.3.1 起配置入口收敛回简单的 ``Db.set_config``（撤销 v0.3.0 的�
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Union
 
 from .config import Config
 from .connection import (
@@ -21,6 +21,9 @@ from .connection import (
 )
 from .query import Query
 from .utils import Raw, raw
+
+if TYPE_CHECKING:  # pragma: no cover - 仅类型检查用
+    from .document import DocumentCollection
 
 
 class Db:
@@ -105,6 +108,19 @@ class Db:
     def table(cls, table: str) -> Query:
         """指定表名（含前缀）开始链式查询。"""
         return Query(cls.get_connection(), table=table, prefix=cls._prefix)
+
+    @classmethod
+    def collection(cls, name: str) -> "DocumentCollection":
+        """打开文档集合（schemaless 文档存储，v0.8.0）。
+
+        无需提前建表与声明字段，首次访问自动建表；用法见
+        :class:`~tinkpyorm.document.DocumentCollection`::
+
+            Db.collection("users").insert({"name": "张三", "age": 25})
+            Db.collection("users").where("age", ">=", 18).select()
+        """
+        from .document import DocumentCollection
+        return DocumentCollection(cls.get_connection(), name, prefix=cls._prefix)
 
     @classmethod
     def name(cls, table: str) -> Query:

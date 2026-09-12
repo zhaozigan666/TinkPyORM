@@ -23,6 +23,19 @@
 | 关联 | `with_` |
 | 其他 | `comment` `lock` `fetch_sql` `fail_exception` `allow_empty` `copy` `get_last_sql` |
 
+## DocumentCollection（文档集合，v0.8.0）
+
+入口：`Db.collection(name)`。详见 [26-Collection文档集合](26-Collection文档集合.md)。
+
+| 类别 | 方法 |
+|---|---|
+| 链式 | `where` `where_or` `where_length` `order` `limit` `page` `schema` |
+| 读取 | `select` `find(pk)` `value` `column` `count` `distinct` `group_counts` |
+| 写入 | `insert` `insert_all` `update` `update_path` `patch` `delete` |
+| DDL | `promote(path, sql_type?, column?)` `ensure_index(path, unique?, name?)` |
+
+条件操作符与 `Query.where` 同一套（`tinkpyorm.JSON_OPS`）；字段名即 JSON 路径。
+
 ## Model（静态）
 
 `find` `find_or_empty` `find_or_fail` `get` `select` `select_or_fail` `create` `update` `destroy` `value` `column` `count` `sum` `avg` `max` `min` `paginate` `query` `with_trashed` `only_trashed`
@@ -33,4 +46,4 @@
 
 ## Db（门面）
 
-`set_config` `get_connection` `close` `table` `name` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+`set_config` `get_connection` `close` `table` `name` `collection` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`

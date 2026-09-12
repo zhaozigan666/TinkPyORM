@@ -19,7 +19,7 @@
 
 **本文件**：[简介](#简介) · [特性](#特性) · [零依赖](#零依赖) · [安装](#安装) · [快速开始](#快速开始) · [更新记录](#更新记录) · [致谢与灵感来源](#致谢与灵感来源) · [许可证](#许可证)
 
-**技术文档**：共 25 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
+**技术文档**：共 26 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
 
 ---
 
@@ -67,6 +67,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **camelCase 别名** —— `whereIn` 自动映射到 `where_in`，PHP/JS 开发者上手无阻
 - **JSON 字段查询** —— `json()` 结果自动格式化为 Python `dict`；`where_json` 家族支持路径条件（比较 / 存在 / 包含 / 长度 / 类型），`field_json` / `order_json` 提取与排序，写入侧自动序列化；SQL 形态由驱动提供，可扩展至 MySQL / MongoDB / Redis
 - **JSON 路径写入** —— `update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch` 在 SQL 内改写嵌套字段，无读改写窗口（并发交错不丢更新），与路径查询对称；`update_json_ops` 在一条语句内按序混合多种操作
+- **文档集合（schemaless）** —— `Db.collection(name)` 无需提前建表与声明字段即可存取文档：点路径条件 / 排序、路径级局部更新、RFC 7396 合并补丁、`promote()` 字段提升（VIRTUAL 生成列）、`ensure_index()` 表达式索引、可选 schema 写入校验
 - **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
@@ -148,6 +149,7 @@ User.destroy(user.id)                                  # 删除
 **入门**
 
 - [01-连接配置](wiki/01-连接配置.md) —— 字典 / 路径 / Connection 三种配置方式、驱动与连接参数
+- [26-Collection文档集合](wiki/26-Collection文档集合.md) —— schemaless 文档存储：CRUD、路径条件、字段提升与索引、schema 校验
 
 **查询**
 
@@ -197,6 +199,19 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.8.0
+
+文档集合（DocumentCollection，schemaless 文档存储）。
+
+- 新增 `tinkpyorm/document.py` 与 `DocumentCollection`，入口 `Db.collection(name)`；无需提前建表与声明字段，首次访问自动建表（`_id` 自增主键 + `data` JSON 文档列）
+- 写入：`insert` / `insert_all`（`_id` 可显式指定）/ `update`（整文档替换，`_id` 不可改）/ `update_path`（路径级局部更新）/ `patch`（RFC 7396 合并补丁）/ `delete`
+- 查询：`find(pk)` / `select` / `value` / `column` / `count` / `distinct` / `group_counts`；链式 `where` / `where_or` / `where_length` / `order` / `limit` / `page`
+- 条件操作符与 `Query.where` 同一套词汇（比较 / `in` / `between` / `like` / `null` / `exists` / `contains`，见 `tinkpyorm.JSON_OPS`）；字段名即 JSON 路径（`"profile.city"`、`"tags[0]"`）
+- `promote(path)` 把字段提升为 VIRTUAL 生成列，写路径零改动，提升字段条件自动改走列；`ensure_index(path)` 为提升列建普通索引、其余字段建表达式索引，幂等
+- 新增配置项 `collection_schema_mode`（默认关闭）：开启后按 `schema()` 声明在写入期校验已声明路径的值类型（bool / int / float / str / list / dict）
+- 新增 `test_collection.py`（59 项）；合计 394 项单元测试 + 174 项示例通过
+- 新增设计文档 `docs/collection.md` 与 `wiki/26-Collection文档集合.md`；wiki 同步发布至 GitHub Wiki
 
 ### v0.7.1
 
