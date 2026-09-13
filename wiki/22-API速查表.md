@@ -47,3 +47,13 @@
 ## Db（门面）
 
 `set_config` `get_connection` `close` `table` `name` `collection` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+
+## 配置键（set_config 一等键）
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `database` / `type` / `prefix` … | - | 连接基础配置，见 [01-连接配置](01-连接配置.md) |
+| `sql_log_enabled` / `sql_log_max` | True / 1000 | SQL 日志开关与上限 |
+| `path_expand` | True | 数据库路径展开 `~` 与环境变量 |
+| `collection_schema_mode` | False | 文档集合写入期 schema 校验（[26](26-Collection文档集合.md)） |
+| `json` | False | 自动建表/建列模式（[27-JSON自动建表](27-JSON自动建表.md)） |

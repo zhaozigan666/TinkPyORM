@@ -68,6 +68,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **JSON 字段查询** —— `json()` 结果自动格式化为 Python `dict`；`where_json` 家族支持路径条件（比较 / 存在 / 包含 / 长度 / 类型），`field_json` / `order_json` 提取与排序，写入侧自动序列化；SQL 形态由驱动提供，可扩展至 MySQL / MongoDB / Redis
 - **JSON 路径写入** —— `update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch` 在 SQL 内改写嵌套字段，无读改写窗口（并发交错不丢更新），与路径查询对称；`update_json_ops` 在一条语句内按序混合多种操作
 - **文档集合（schemaless）** —— `Db.collection(name)` 无需提前建表与声明字段即可存取文档：点路径条件 / 排序、路径级局部更新、RFC 7396 合并补丁、`promote()` 字段提升（VIRTUAL 生成列）、`ensure_index()` 表达式索引、可选 schema 写入校验
+- **JSON 自动建表模式** —— `Db.set_config({"json": True})` 后，`Db.table()` / `Db.name()` 遇到不存在的表自动创建（`id` 自增主键），插入 dict 数据缺失字段自动加列（按值推断类型，dict/list 存 JSON 文本），`insert_all` 支持异构行并集补 `None`
 - **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
@@ -150,6 +151,7 @@ User.destroy(user.id)                                  # 删除
 
 - [01-连接配置](wiki/01-连接配置.md) —— 字典 / 路径 / Connection 三种配置方式、驱动与连接参数
 - [26-Collection文档集合](wiki/26-Collection文档集合.md) —— schemaless 文档存储：CRUD、路径条件、字段提升与索引、schema 校验
+- [27-JSON自动建表](wiki/27-JSON自动建表.md) —— `json: True` 模式：Db.table/Db.name 自动建表、缺失字段自动加列、类型推断
 
 **查询**
 
@@ -199,6 +201,18 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.9.0
+
+JSON 自动建表/建列模式（`Db.table` / `Db.name` 的 schemaless 写入）。
+
+- 新增一等配置键 `json`（`Db.set_config({"json": True})`，默认关闭）
+- `Db.table()` / `Db.name()` 遇到不存在的表自动创建（`id` 自增主键）；读路径（select / find / count / chunk）缺表同样自动建表并返回空集
+- `insert` / `insert_all` 插入 dict 数据时缺失字段自动 `ALTER TABLE ADD COLUMN`：`bool`/`int` → INTEGER、`float` → REAL、其余 → TEXT（dict/list 自动 JSON 编码，可用 `json()` 解码回读）
+- `insert_all` 在该模式下支持异构行：按各行字段并集插入，缺失字段补 `None`
+- 边界：仅主表参与（join 关联表不建）；`update` 不补列；`fetch_sql` 不产生 DDL；字段名须为裸标识符；对已有表零侵入（只追加缺失列）
+- 新增 `test_autojson.py`（17 项）；合计 436 项单元测试 + 174 项示例通过
+- 新增 `wiki/27-JSON自动建表.md`；wiki 同步发布至 GitHub Wiki
 
 ### v0.8.0
 

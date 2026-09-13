@@ -35,6 +35,9 @@ _JSON_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 #: 定义在 utils 中以便 Model 层复用同一对象（身份比较必须是同一实例）
 _UNSET = UNSET
 
+#: json 模式自动建列的字段名白名单（裸标识符，杜绝注入与歧义）
+_AUTO_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 class Query:
     """链式查询构造器。"""
@@ -81,6 +84,7 @@ class Query:
         self._last_sql = ""
         self._last_params: list = []
         self._soft_applied = False
+        self._auto_ensured = False  # json 模式建表幂等缓存（读路径）
         if table:
             self.table(table)
 
@@ -703,6 +707,80 @@ class Query:
         """解析表前缀（未显式给出时为空字符串）。"""
         return self.prefix or ""
 
+    # ------------------------------------------------------------------ #
+    # json 模式：自动建表 / 自动建列（v0.9.0，Db.set_config {'json': True}）
+    # ------------------------------------------------------------------ #
+    def _auto_json_table(self) -> Optional[str]:
+        """json 模式作用的目标表：主表（options['table'] 恰有一项且为
+        裸标识符）。join 的关联表存于 options['join']，不参与自动建表；
+        复杂表名（子查询/带符号）一律跳过，防止误建。
+
+        表名在 ``table()`` / ``name()`` 时已含前缀。
+        """
+        tables = self.options.get("table") or []
+        if len(tables) != 1:
+            return None
+        name = tables[0].get("name")
+        if name and _AUTO_IDENT_RE.match(name):
+            return name
+        return None
+
+    @staticmethod
+    def _auto_json_type(value: Any) -> str:
+        """按 Python 值推断建列类型。dict/list 存 TEXT（写入路径自动
+        JSON 编码）；None 无类型信息，落 TEXT；SQLite 本身动态类型，
+        声明仅为可读性。"""
+        if isinstance(value, bool):
+            return "INTEGER"
+        if isinstance(value, int):
+            return "INTEGER"
+        if isinstance(value, float):
+            return "REAL"
+        return "TEXT"
+
+    def _auto_json_ensure(self, rows: Sequence[dict]) -> None:
+        """json 模式：表不存在则自动创建，rows 中缺失字段自动加列。
+
+        - 建表形态：``id INTEGER PRIMARY KEY AUTOINCREMENT``（幂等 DDL，
+          读路径按实例缓存避免重复执行）；
+        - 建列：按 rows 出现过的字段补 ``ALTER TABLE ADD COLUMN``，
+          每次写入都对照 ``PRAGMA table_info``（不缓存列清单——列可能被
+          其他实例/进程并发补上）；
+        - 边界：fetch_sql 不执行任何 DDL；join/多表/复杂表名不参与；
+          字段名须为裸标识符否则抛 ``InvalidArgumentException``；
+          update 不补列（无行可更新时建列无意义）。
+        """
+        if self.options.get("fetch_sql"):
+            return
+        conn = self._resolve_conn()
+        if not getattr(conn.config, "json", False):
+            return
+        table = self._auto_json_table()
+        if table is None:
+            return
+        qi = conn.driver.quote_identifier
+        if not self._auto_ensured:
+            conn.execute(
+                f"CREATE TABLE IF NOT EXISTS {qi(table)} "
+                f"({qi('id')} INTEGER PRIMARY KEY AUTOINCREMENT)")
+            self._auto_ensured = True
+        if not rows:
+            return
+        cols = {r["name"] for r in
+                conn.query(f"PRAGMA table_info({qi(table)})")}
+        for row in rows:
+            for key, value in row.items():
+                if key in cols:
+                    continue
+                if not _AUTO_IDENT_RE.match(key):
+                    raise InvalidArgumentException(
+                        f"json 自动建列要求字段名为合法标识符"
+                        f"（字母/数字/下划线，不以数字开头），收到: {key!r}")
+                conn.execute(
+                    f"ALTER TABLE {qi(table)} ADD COLUMN {qi(key)} "
+                    f"{self._auto_json_type(value)}")
+                cols.add(key)
+
     def _apply_soft_delete(self) -> None:
         """模型软删除：自动追加 delete_time IS NULL（仅一次）。"""
         sd = self.options.get("soft_delete")
@@ -711,6 +789,7 @@ class Query:
             self._soft_applied = True
 
     def _execute_select(self) -> Tuple[str, list]:
+        self._auto_json_ensure([])   # json 模式：表不存在则自动创建（读返回空集）
         self._apply_soft_delete()
         conn = self._resolve_conn()
         sql, params = self.builder.select(self.options)
@@ -945,6 +1024,7 @@ class Query:
         if not data:
             raise QueryError("insert 数据不能为空")
         conn = self._resolve_conn()
+        self._auto_json_ensure([data])   # json 模式：自动建表 + 缺失字段自动加列
         sql, params = self.builder.insert(self.options, data)
         self._last_sql, self._last_params = sql, params
         if self.options["fetch_sql"]:
@@ -966,6 +1046,19 @@ class Query:
         if not data_list:
             return 0
         conn = self._resolve_conn()
+        self._auto_json_ensure(data_list)  # json 模式：自动建表 + 并集字段自动加列
+        if getattr(conn.config, "json", False) and \
+                self._auto_json_table() is not None:
+            # json 模式放宽 insert_all 的"各行字段一致"约束：
+            # 以各行字段并集为准，缺失字段补 None（列已由 ensure 补齐）
+            keys: List[str] = []
+            seen: set = set()
+            for row in data_list:
+                for k in row:
+                    if k not in seen:
+                        seen.add(k)
+                        keys.append(k)
+            data_list = [{k: row.get(k) for k in keys} for row in data_list]
 
         fields = list(data_list[0].keys())
         size = batch_size or max(1, MAX_SQL_VARIABLES // max(len(fields), 1))

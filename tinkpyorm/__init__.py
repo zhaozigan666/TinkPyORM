@@ -73,6 +73,15 @@ JSON 路径级局部更新（v0.6.0）::
     docs.promote("age")          # 提升为生成列，可建普通索引
     docs.ensure_index("profile.city")   # 其余字段建表达式索引
 
+JSON 自动建表/建列模式（v0.9.0）—— Db.table/Db.name 直接插入 dict::
+
+    Db.set_config({"database": "app.db", "json": True})
+    Db.name("events").insert({"type": "click", "payload": {"x": 1}})
+    # 表不存在自动创建（id 自增主键）；字段不存在自动 ALTER TABLE ADD COLUMN
+    # （按值推断类型，dict/list 存 JSON 文本，可用 .json() 解码回读）
+    Db.name("events").insert_all([{"type": "a", "n": 1},
+                                  {"type": "b", "s": "x"}])  # 缺失字段补 None
+
 扩展新数据库（v0.7.1 起配置层跟上注册表）::
 
     from tinkpyorm import register_driver, available_type_names, SQLDriver
@@ -109,7 +118,7 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 
 __all__ = [
