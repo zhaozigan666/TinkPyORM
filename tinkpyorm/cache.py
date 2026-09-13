@@ -18,13 +18,18 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
+import tempfile
 import threading
 import time
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
+from .exceptions import InvalidArgumentException
+
 __all__ = [
-    "CacheStore", "MemoryCacheStore",
+    "CacheStore", "MemoryCacheStore", "FileCacheStore",
     "DEFAULT_MAX_ITEMS", "SEPARATOR",
     "store", "set_store", "clear", "make_key", "prefix_for", "stats",
 ]
@@ -145,6 +150,177 @@ class MemoryCacheStore(CacheStore):
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
         return f"<MemoryCacheStore items={len(self._data)}/{self.max_items}>"
+
+
+class FileCacheStore(CacheStore):
+    """本地文件缓存（v0.9.1）。
+
+    每个条目一个 JSON 文件（文件名为键的 MD5 摘要，避免键中的
+    ``\\x00`` 等字符不合法），内容为 ``{"key", "value", "expire_at"}``。
+
+    特性：
+
+    1. **进程重启后仍在** —— 数据落盘，适合脚本类一次性进程复用查询结果。
+    2. **过期即清** —— 读取时惰性删除过期文件；实例化与 :meth:`purge`
+       时全量清理过期条目，不会留下垃圾文件。
+    3. **原子写入** —— 先写临时文件再 ``os.replace``，多进程并发使用
+       同一缓存目录不会读到半截内容。
+    4. **容量上限** —— 超出 ``max_items`` 按"最久未使用"（文件 mtime）
+       淘汰；命中时触碰 mtime 以延续存活。
+    5. **值须 JSON 可序列化** —— 查询结果（行字典列表）天然满足；
+       存自定义对象请改用内存后端或自行实现 :class:`CacheStore`。
+
+    由 ``Db.set_config({"cache_backend": "file", "cache_dir": ...})``
+    启用，也可手动 ``cache.set_store(FileCacheStore(path))`` 注入。
+    """
+
+    def __init__(self, cache_dir: str,
+                 max_items: int = DEFAULT_MAX_ITEMS) -> None:
+        if not cache_dir or not str(cache_dir).strip():
+            raise InvalidArgumentException("文件缓存目录不能为空")
+        self.cache_dir = os.fspath(cache_dir)
+        self.max_items = max_items
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._lock = threading.RLock()
+        self._hits = 0
+        self._misses = 0
+        self.purge()  # 启动即清理历史遗留的过期文件
+
+    # ------------------------------------------------------------------ #
+    # 内部工具
+    # ------------------------------------------------------------------ #
+    def _path(self, key: str) -> str:
+        digest = hashlib.md5(key.encode("utf-8", "replace")).hexdigest()
+        return os.path.join(self.cache_dir, digest + ".json")
+
+    @staticmethod
+    def _read(path: str) -> Optional[Dict[str, Any]]:
+        """读取条目文件；损坏/不存在返回 None（容错：直接当未命中处理）。"""
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _remove(path: str) -> bool:
+        try:
+            os.remove(path)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    def _entries(self) -> List[str]:
+        """目录下全部条目文件路径（按 mtime 从旧到新）。"""
+        try:
+            names = os.listdir(self.cache_dir)
+        except OSError:
+            return []
+        paths = [os.path.join(self.cache_dir, n) for n in names
+                 if n.endswith(".json")]
+        paths.sort(key=lambda p: (os.stat(p).st_mtime if os.path.exists(p)
+                                  else 0))
+        return paths
+
+    # ------------------------------------------------------------------ #
+    # 读写
+    # ------------------------------------------------------------------ #
+    def get(self, key: str) -> Tuple[bool, Any]:
+        with self._lock:
+            data = self._read(self._path(key))
+            if data is None or data.get("key") != key:
+                self._misses += 1
+                return False, None
+            expire_at = data.get("expire_at")
+            if expire_at is not None and time.time() >= expire_at:
+                self._remove(self._path(key))  # 过期即清
+                self._misses += 1
+                return False, None
+            self._hits += 1
+            try:  # 触碰 mtime，作为 LRU 依据
+                os.utime(self._path(key))
+            except OSError:
+                pass
+            return True, data.get("value")
+
+    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
+        expire_at = None
+        if ttl is not None and ttl > 0:
+            expire_at = time.time() + ttl
+        payload = json.dumps(
+            {"key": key, "value": value, "expire_at": expire_at},
+            ensure_ascii=False, default=str)
+        with self._lock:
+            # 容量上限：写入前按 mtime 淘汰最旧条目（含即将被覆盖的键不计）
+            entries = [p for p in self._entries()
+                       if not p.endswith(os.path.basename(self._path(key)))]
+            while self.max_items and len(entries) >= self.max_items:
+                self._remove(entries.pop(0))
+            path = self._path(key)
+            fd, tmp = tempfile.mkstemp(dir=self.cache_dir, suffix=".tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(payload)
+                os.replace(tmp, path)  # 原子替换
+            except OSError:
+                self._remove(tmp)
+                raise
+
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            return self._remove(self._path(key))
+
+    def clear(self, prefix: Optional[str] = None) -> int:
+        with self._lock:
+            removed = 0
+            for path in self._entries():
+                if not prefix:
+                    removed += int(self._remove(path))
+                    continue
+                data = self._read(path)
+                if data is not None and \
+                        str(data.get("key", "")).startswith(prefix):
+                    removed += int(self._remove(path))
+            return removed
+
+    # ------------------------------------------------------------------ #
+    # 维护
+    # ------------------------------------------------------------------ #
+    def purge(self) -> int:
+        """清理所有已过期条目文件，返回清理数量。"""
+        now = time.time()
+        with self._lock:
+            removed = 0
+            for path in self._entries():
+                data = self._read(path)
+                if data is None:
+                    continue
+                expire_at = data.get("expire_at")
+                if expire_at is not None and now >= expire_at:
+                    removed += int(self._remove(path))
+            return removed
+
+    def stats(self) -> Dict[str, Any]:
+        with self._lock:
+            total = self._hits + self._misses
+            return {
+                "backend": "file",
+                "dir": self.cache_dir,
+                "items": len(self._entries()),
+                "max_items": self.max_items,
+                "hits": self._hits,
+                "misses": self._misses,
+                "hit_rate": (self._hits / total) if total else 0.0,
+            }
+
+    def __len__(self) -> int:
+        return len(self._entries())
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return (f"<FileCacheStore dir={self.cache_dir!r} "
+                f"items={len(self)}/{self.max_items}>")
 
 
 # ---------------------------------------------------------------------- #

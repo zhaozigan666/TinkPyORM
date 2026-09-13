@@ -57,3 +57,4 @@
 | `path_expand` | True | 数据库路径展开 `~` 与环境变量 |
 | `collection_schema_mode` | False | 文档集合写入期 schema 校验（[26](26-Collection文档集合.md)） |
 | `json` | False | 自动建表/建列模式（[27-JSON自动建表](27-JSON自动建表.md)） |
+| `cache_backend` / `cache_dir` | memory / - | 查询缓存后端：`memory` / `file`（file 须提供目录，见 [19-查询缓存](19-查询缓存.md)） |

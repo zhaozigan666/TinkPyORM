@@ -69,7 +69,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **JSON 路径写入** —— `update_json` / `update_json_insert` / `update_json_remove` / `update_json_patch` 在 SQL 内改写嵌套字段，无读改写窗口（并发交错不丢更新），与路径查询对称；`update_json_ops` 在一条语句内按序混合多种操作
 - **文档集合（schemaless）** —— `Db.collection(name)` 无需提前建表与声明字段即可存取文档：点路径条件 / 排序、路径级局部更新、RFC 7396 合并补丁、`promote()` 字段提升（VIRTUAL 生成列）、`ensure_index()` 表达式索引、可选 schema 写入校验
 - **JSON 自动建表模式** —— `Db.set_config({"json": True})` 后，`Db.table()` / `Db.name()` 遇到不存在的表自动创建（`id` 自增主键），插入 dict 数据缺失字段自动加列（按值推断类型，dict/list 存 JSON 文本），`insert_all` 支持异构行并集补 `None`
-- **查询缓存** —— `cache(秒)` 进程级 TTL 缓存，写操作自动失效，后端可替换
+- **查询缓存** —— `cache(秒)` TTL 缓存，写操作自动失效；后端可选进程内存或本地文件（落盘持久、多进程共享）
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
 - **调试友好** —— SQL 日志、`fetch_sql`、最后一条 SQL 查询
@@ -201,6 +201,18 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.9.1
+
+查询缓存文件后端（本地文件缓存）。
+
+- 新增一等配置键 `cache_backend`（`memory` 默认 / `file`）与 `cache_dir`
+- `cache_backend="file"` 时查询缓存写入指定目录：每条目一个 JSON 文件，进程重启后仍在，多进程共享
+- 过期条目自动清理：读取时惰性删除，实例化与 `purge()` 时全量清理
+- 写入采用临时文件 + `os.replace` 原子替换；容量超限（默认 500 条）按最久未使用（mtime）淘汰
+- `cache_backend="file"` 必须同时提供 `cache_dir`；非法后端名在配置期报错
+- 新增 `FileCacheStore` 并导出；`set_config` 传入缓存键时自动切换后端，手动 `cache.set_store()` 注入的后端不受影响
+- `test_cache.py` 24 → 44 项；合计 456 项单元测试 + 174 项示例通过
 
 ### v0.9.0
 

@@ -97,7 +97,7 @@ JSON 自动建表/建列模式（v0.9.0）—— Db.table/Db.name 直接插入 d
 等属"预留名"：配置阶段放行，到建立连接时才抛 ``DriverNotAvailable``。
 """
 from .builder import JsonWhere, JsonUpdate, JSON_OPS, JSON_UPDATE_MODES
-from .cache import CacheStore, MemoryCacheStore
+from .cache import CacheStore, MemoryCacheStore, FileCacheStore
 from .collection import Collection, Paginator
 from .config import available_type_names
 from .connection import Connection
@@ -118,14 +118,14 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
     "DocumentCollection",
     "Raw", "raw", "to_snake", "to_camel",
-    "CacheStore", "MemoryCacheStore",
+    "CacheStore", "MemoryCacheStore", "FileCacheStore",
     "JsonWhere", "JsonUpdate", "JSON_OPS", "JSON_UPDATE_MODES",
     "normalize_json_path", "available_type_names",
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",

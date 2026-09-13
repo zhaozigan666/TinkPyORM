@@ -53,6 +53,7 @@ COMMON_KEYS = frozenset({
     "host", "port", "user", "username", "password", "options",
     "sql_log_enabled", "sql_log_max", "connect_timeout", "path_expand",
     "collection_schema_mode", "json",
+    "cache_backend", "cache_dir",
 })
 
 #: 可直接透传给 sqlite3.connect() 的参数白名单
@@ -163,6 +164,12 @@ class Config:
     #: dict 数据时缺失字段自动 ``ALTER TABLE ADD COLUMN``（按值推断类型，
     #: dict/list 存为 JSON 文本）。仅对单表查询生效，默认关闭。
     json: bool = False
+    #: 查询缓存后端（v0.9.1）：``"memory"`` 进程内存（默认），
+    #: ``"file"`` 本地文件缓存（进程重启后仍在，跨进程共享）。
+    cache_backend: str = "memory"
+    #: 文件缓存的目录（``cache_backend="file"`` 时必填）。
+    #: 目录不存在会自动创建；过期条目在读取时与启动时自动清理。
+    cache_dir: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.type = normalize_type(self.type)
@@ -177,6 +184,20 @@ class Config:
         self.path_expand = _to_bool(self.path_expand)
         self.collection_schema_mode = _to_bool(self.collection_schema_mode)
         self.json = _to_bool(self.json)
+        # 缓存后端归一化与校验（v0.9.1）
+        if isinstance(self.cache_backend, str):
+            self.cache_backend = self.cache_backend.strip().lower()
+        if self.cache_backend not in ("memory", "file"):
+            raise InvalidArgumentException(
+                f"cache_backend 仅支持 'memory' / 'file'，收到: "
+                f"{self.cache_backend!r}")
+        if self.cache_backend == "file":
+            if not self.cache_dir or not str(self.cache_dir).strip():
+                raise InvalidArgumentException(
+                    "cache_backend='file' 时必须提供 cache_dir（缓存目录）")
+            self.cache_dir = str(self.cache_dir)
+        else:
+            self.cache_dir = None  # memory 模式下目录无意义，归一为 None
         self.options = dict(self.options or {})
         if self.path_expand:
             self.database = self._expand_path(self.database)
@@ -227,6 +248,8 @@ class Config:
             "connect_timeout": self.connect_timeout,
             "path_expand": self.path_expand,
             "collection_schema_mode": self.collection_schema_mode,
+            "cache_backend": self.cache_backend,
+            "cache_dir": self.cache_dir,
             "json": self.json,
         }
         for key in ("host", "port", "user", "password"):

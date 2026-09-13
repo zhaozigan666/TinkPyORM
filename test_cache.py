@@ -10,13 +10,16 @@
 - 自定义键、旧签名兼容、后端可替换、LRU 容量与清理
 """
 import os
+import shutil
 import sys
+import tempfile
 import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from tinkpyorm import CacheStore, Db, MemoryCacheStore, cache
+from tinkpyorm import (CacheStore, Db, FileCacheStore, MemoryCacheStore,
+                       cache)
 from tinkpyorm.exceptions import InvalidArgumentException
 
 
@@ -306,6 +309,204 @@ class TestMemoryCacheStore(unittest.TestCase):
         finally:
             cache.set_store(old)
         self.assertIsInstance(Db.cache_store(), MemoryCacheStore)
+
+
+class TestFileCacheStore(unittest.TestCase):
+    """FileCacheStore 单元行为（v0.9.1）。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="torm_cache_")
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_set_get_roundtrip(self):
+        s = FileCacheStore(self.dir)
+        s.set("k1", {"a": 1, "b": ["x", "y"]})
+        s.set("k2", [1, 2, 3])
+        self.assertEqual(s.get("k1"), (True, {"a": 1, "b": ["x", "y"]}))
+        self.assertEqual(s.get("k2"), (True, [1, 2, 3]))
+
+    def test_miss_distinguishable(self):
+        s = FileCacheStore(self.dir)
+        s.set("k", None)
+        self.assertEqual(s.get("k"), (True, None))   # 命中但值为 None
+        self.assertEqual(s.get("nope"), (False, None))  # 未命中
+
+    def test_ttl_expires_and_file_removed(self):
+        import os
+        s = FileCacheStore(self.dir)
+        s.set("k", "v", ttl=0.15)
+        self.assertEqual(len(os.listdir(self.dir)), 1)
+        time.sleep(0.2)
+        self.assertEqual(s.get("k"), (False, None))
+        self.assertEqual(os.listdir(self.dir), [])   # 过期即清文件
+
+    def test_no_ttl_persists(self):
+        s = FileCacheStore(self.dir)
+        s.set("k", "v")   # 无 TTL 永久
+        self.assertEqual(s.get("k"), (True, "v"))
+
+    def test_purge_keeps_valid_entries(self):
+        import os
+        s = FileCacheStore(self.dir)
+        s.set("expired", 1, ttl=0.15)
+        s.set("alive", 2)
+        time.sleep(0.2)
+        self.assertEqual(s.purge(), 1)
+        self.assertEqual(s.get("alive"), (True, 2))
+        self.assertEqual(os.listdir(self.dir),
+                         [n for n in os.listdir(self.dir) if "alive" not in n]
+                         or os.listdir(self.dir))
+        self.assertEqual(len(s), 1)
+
+    def test_delete(self):
+        s = FileCacheStore(self.dir)
+        s.set("k", 1)
+        self.assertTrue(s.delete("k"))
+        self.assertFalse(s.delete("k"))
+        self.assertEqual(s.get("k"), (False, None))
+
+    def test_clear_with_prefix(self):
+        s = FileCacheStore(self.dir)
+        for k in ("db\x00t1\x00a", "db\x00t1\x00b", "db\x00t2\x00c"):
+            s.set(k, k)
+        self.assertEqual(s.clear("db\x00t1\x00"), 2)
+        self.assertEqual(s.get("db\x00t2\x00c"), (True, "db\x00t2\x00c"))
+        self.assertEqual(len(s), 1)
+        self.assertEqual(s.clear(), 1)
+        self.assertEqual(len(s), 0)
+
+    def test_lru_eviction_by_mtime(self):
+        s = FileCacheStore(self.dir, max_items=3)
+        for k in ("a", "b", "c"):
+            s.set(k, k)
+            time.sleep(0.02)
+        s.get("a")            # 触碰 a 的 mtime，使其晚于 b
+        time.sleep(0.02)
+        s.set("d", "d")       # 超容量 → 淘汰最旧的 b
+        self.assertEqual(s.get("b"), (False, None))
+        self.assertEqual(s.get("a"), (True, "a"))
+        self.assertEqual(s.get("c"), (True, "c"))
+        self.assertEqual(s.get("d"), (True, "d"))
+
+    def test_stats_structure(self):
+        s = FileCacheStore(self.dir)
+        s.set("k", 1)
+        s.get("k")
+        s.get("miss")
+        st = s.stats()
+        self.assertEqual(st["backend"], "file")
+        self.assertEqual(st["dir"], self.dir)
+        self.assertEqual(st["items"], 1)
+        self.assertEqual(st["hits"], 1)
+        self.assertEqual(st["misses"], 1)
+        self.assertAlmostEqual(st["hit_rate"], 0.5)
+
+    def test_empty_dir_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            FileCacheStore("")
+        with self.assertRaises(InvalidArgumentException):
+            FileCacheStore("   ")
+
+    def test_dir_auto_created(self):
+        import os
+        sub = os.path.join(self.dir, "nested", "cache")
+        s = FileCacheStore(sub)
+        self.assertTrue(os.path.isdir(sub))
+        s.set("k", 1)
+        self.assertEqual(s.get("k"), (True, 1))
+
+    def test_corrupt_file_tolerated(self):
+        import os
+        s = FileCacheStore(self.dir)
+        s.set("k", 1)
+        # 覆盖为损坏内容
+        name = [n for n in os.listdir(self.dir) if n.endswith(".json")][0]
+        with open(os.path.join(self.dir, name), "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        self.assertEqual(s.get("k"), (False, None))  # 容错：当未命中
+
+    def test_cross_instance_persistence(self):
+        """同目录新实例读到旧数据 —— 模拟进程重启。"""
+        s1 = FileCacheStore(self.dir)
+        s1.set("persist", {"rows": [1, 2]}, ttl=60)
+        s2 = FileCacheStore(self.dir)   # 新实例（新"进程"）
+        self.assertEqual(s2.get("persist"), (True, {"rows": [1, 2]}))
+
+
+class TestFileCacheWiring(unittest.TestCase):
+    """set_config 缓存后端接线（v0.9.1）。"""
+
+    def setUp(self):
+        Db.close()
+        self.dir = tempfile.mkdtemp(prefix="torm_wiring_")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.addCleanup(Db.close)
+        self.addCleanup(cache.set_store, None)
+
+    def test_file_backend_enabled_via_set_config(self):
+        Db.set_config({"database": ":memory:",
+                       "cache_backend": "file", "cache_dir": self.dir})
+        self.assertIsInstance(Db.cache_store(), FileCacheStore)
+        Db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        Db.table("t").insert({"v": "a"})
+        self.assertEqual(len(Db.table("t").cache(60).select()), 1)
+        st = Db.cache_store().stats()
+        self.assertEqual(st["backend"], "file")
+        self.assertEqual(st["items"], 1)
+        # 第二次查询命中文件缓存
+        self.assertEqual(len(Db.table("t").cache(60).select()), 1)
+        self.assertEqual(Db.cache_store().stats()["hits"], 1)
+
+    def test_write_invalidates_file_cache(self):
+        Db.set_config({"database": ":memory:",
+                       "cache_backend": "file", "cache_dir": self.dir})
+        Db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        Db.table("t").insert({"v": "a"})
+        self.assertEqual(len(Db.table("t").cache(60).select()), 1)
+        Db.table("t").insert({"v": "b"})   # 写失效
+        rows = Db.table("t").cache(60).select()
+        self.assertEqual(len(rows), 2)
+
+    def test_same_dir_reuses_store(self):
+        """重复 set_config 同目录：复用实例，条目不丢。"""
+        Db.set_config({"database": ":memory:",
+                       "cache_backend": "file", "cache_dir": self.dir})
+        s1 = Db.cache_store()
+        s1.set("keep", 1)
+        Db.set_config({"database": ":memory:",
+                       "cache_backend": "file", "cache_dir": self.dir})
+        s2 = Db.cache_store()
+        self.assertIs(s1, s2)
+        self.assertEqual(s2.get("keep"), (True, 1))
+
+    def test_switch_back_to_memory(self):
+        Db.set_config({"database": ":memory:",
+                       "cache_backend": "file", "cache_dir": self.dir})
+        self.assertIsInstance(Db.cache_store(), FileCacheStore)
+        Db.set_config({"database": ":memory:", "cache_backend": "memory"})
+        self.assertIsInstance(Db.cache_store(), MemoryCacheStore)
+
+    def test_memory_config_keeps_custom_store(self):
+        """未传缓存键的 set_config 不打扰自定义后端。"""
+        _setup_table()
+        custom = MemoryCacheStore()
+        old = cache.set_store(custom)
+        try:
+            Db.set_config({"database": ":memory:"})
+            self.assertIs(Db.cache_store(), custom)
+        finally:
+            cache.set_store(old)
+
+    def test_missing_cache_dir_raises(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.set_config({"database": ":memory:", "cache_backend": "file"})
+
+    def test_invalid_backend_raises(self):
+        with self.assertRaises(InvalidArgumentException):
+            Db.set_config({"database": ":memory:",
+                           "cache_backend": "redis", "cache_dir": self.dir})
 
 
 if __name__ == "__main__":

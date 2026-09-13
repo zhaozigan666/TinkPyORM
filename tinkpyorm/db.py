@@ -73,11 +73,39 @@ class Db:
             if prefix:
                 cls._prefix = prefix
             cls._connections[name] = conn
+            cls._apply_cache_config(config)
         else:
             raise TypeError(f"不支持的配置类型: {type(config)}")
         if name == cls._default_name:
             set_default_connection(conn)
         return conn
+
+    @classmethod
+    def _apply_cache_config(cls, config: dict) -> None:
+        """按 ``set_config`` 传入的缓存键切换缓存后端（v0.9.1）。
+
+        仅当本次显式传入 ``cache_backend`` / ``cache_dir`` 时才切换，
+        不打扰手动 ``cache.set_store()`` 注入的自定义后端：
+
+        * ``cache_backend="file"`` → 启用 :class:`FileCacheStore`
+          （目录已存在同路径实例时复用，避免重复清空）；
+        * ``cache_backend="memory"`` → 若当前是文件后端则切回内存，
+          其他自定义后端保持不变。
+        """
+        if not isinstance(config, dict) or not (
+                "cache_backend" in config or "cache_dir" in config):
+            return
+        from . import cache as _cache
+        from .cache import FileCacheStore
+        cfg = cls.get_connection().config
+        if cfg.cache_backend == "file":
+            current = _cache.store()
+            if isinstance(current, FileCacheStore) and \
+                    current.cache_dir == cfg.cache_dir:
+                return
+            _cache.set_store(FileCacheStore(cfg.cache_dir))
+        elif isinstance(_cache.store(), FileCacheStore):
+            _cache.set_store(None)  # 切回内存后端
 
     @classmethod
     def get_connection(cls, name: Optional[str] = None) -> Connection:
