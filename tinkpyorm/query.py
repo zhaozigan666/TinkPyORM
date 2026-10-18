@@ -1535,9 +1535,17 @@ class Query:
         _cache.store().set(key, value, ttl)
 
     def _invalidate_cache(self) -> int:
-        """写操作后清除同一库同一表的全部缓存，返回清除条数。"""
+        """写操作后清除同一库同一表的全部缓存，返回清除条数。
+
+        同时清理依赖本表的全文检索缓存：FTS 表由内容表的触发器写入，
+        不经过 Query，自身无法感知这次写入。
+        """
         prefix = _cache.prefix_for(self._cache_database(), self._cache_table())
-        return _cache.clear(prefix)
+        cleared = _cache.clear(prefix)
+        from .fts import invalidate_dependents
+        cleared += invalidate_dependents(self._cache_database(),
+                                         self._cache_table())
+        return cleared
 
     def _process_row(self, row: Any) -> dict:
         """单行后处理：JSON 解码 -> 获取器（attr）-> filter 回调。

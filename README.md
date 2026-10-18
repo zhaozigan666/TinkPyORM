@@ -19,7 +19,7 @@
 
 **本文件**：[简介](#简介) · [特性](#特性) · [零依赖](#零依赖) · [安装](#安装) · [快速开始](#快速开始) · [更新记录](#更新记录) · [致谢与灵感来源](#致谢与灵感来源) · [许可证](#许可证)
 
-**技术文档**：共 26 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
+**技术文档**：共 29 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
 
 ---
 
@@ -70,6 +70,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **文档集合（schemaless）** —— `Db.collection(name)` 无需提前建表与声明字段即可存取文档：点路径条件 / 排序、路径级局部更新、RFC 7396 合并补丁、`promote()` 字段提升（VIRTUAL 生成列）、`ensure_index()` 表达式索引、可选 schema 写入校验
 - **JSON 自动建表模式** —— `Db.set_config({"json": True})` 后，`Db.table()` / `Db.name()` 遇到不存在的表自动创建（`id` 自增主键），插入 dict 数据缺失字段自动加列（按值推断类型，dict/list 存 JSON 文本），`insert_all` 支持异构行并集补 `None`
 - **查询缓存** —— `cache(秒)` TTL 缓存，写操作自动失效；后端可选进程内存或本地文件（落盘持久、多进程共享）
+- **全文检索（FTS5）** —— `Db.fts(name)` 建 FTS5 索引：external 模式自动挂增删改触发器，`search()` 支持布尔 / 短语 / 列过滤 / 前缀 / NEAR，`rank()` 按 bm25 加权相关度排序，`highlight()` / `snippet()` 取高亮与摘要；默认 `trigram` 分词中英文兼顾；模型可声明 `__fts__` 后用 `Model.search()` 直接拿模型实例
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
 - **调试友好** —— SQL 日志、`fetch_sql`、最后一条 SQL 查询
@@ -176,6 +177,7 @@ User.destroy(user.id)                                  # 删除
 - [03-聚合分组排序分页](wiki/03-聚合分组排序分页.md) —— count·sum·max、group + having、order、limit 与分页
 - [04-JOIN与UNION](wiki/04-JOIN与UNION.md) —— join / inner / left / right、union 与 unionAll
 - [05-原生表达式](wiki/05-原生表达式.md) —— raw() 在 WHERE、UPDATE、字段片段中的用法与安全边界
+- [28-全文检索](wiki/28-全文检索.md) —— FTS5 全文索引：external/standalone、bm25 相关度、高亮与摘要、中文 trigram 契约
 - [16-结果集与分页](wiki/16-结果集与分页.md) —— Collection 行为与 Paginator 分页输出
 - [17-camelCase别名](wiki/17-camelCase别名.md) —— 蛇形列名映射为驼峰输出的规则
 
@@ -218,6 +220,21 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.10.0
+
+SQLite FTS5 全文检索。
+
+- 新增 `Db.fts(name)` → `FtsIndex`：建索引、删索引、`rebuild` / `optimize` / `integrity_check` / `info`
+- 两种模式：`external`（默认，索引只存词条，原文留主表，自动挂 INSERT/UPDATE/DELETE 三个同步触发器）与 `standalone`（独立 FTS 表）
+- 检索链：`search()` 支持布尔 / 短语 / 列过滤 / 前缀 / NEAR；`rank()` 按 `bm25()` 加权排序、`order()` 覆盖排序、`limit()` / `page()` 分页、`where()` 叠加主表条件（编译为 `rowid IN (子查询)`）、`highlight()` / `snippet()` 输出高亮与摘要
+- 默认分词器 `trigram`：中英文均可做子串匹配，代价是索引变为原文 3–5 倍、**查询词项少于 3 字符必然 0 命中**（已固化为测试契约）
+- 安全：检索串全程绑定参数；列名 / 表名 / tokenize 声明走白名单校验；`highlight` 标记作为 SQL 字面量转义
+- 缓存联动：维护「内容表 → FTS 表」依赖注册表，写主表时顺带清理检索结果缓存
+- 模型集成：声明 `__fts__` 后可用 `Model.search()` 与 `Model.fts_index()`，结果自动转模型实例
+- 新增 `Driver.supports_fts` 能力标志；非 SQLite 驱动在构造期即抛 `UnsupportedOperation`
+- 新增 `test_fts.py`（49 项）；合计 **510 项单元测试 + 174 项示例**通过
+- 新增 `wiki/28-全文检索.md`
 
 ### v0.9.2
 

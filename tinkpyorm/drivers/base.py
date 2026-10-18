@@ -231,6 +231,13 @@ class Driver(abc.ABC):
     #: 快速失败并给出明确提示，而不是运行到一半抛 "no such table"。
     supports_document: bool = False
 
+    #: 是否支持全文检索（:class:`~tinkpyorm.fts.FtsIndex`，依赖 FTS5 模块）。
+    #:
+    #: 仅 SQLite 内置 FTS5；其它驱动需自行实现等价的索引与检索方言后，
+    #: 才能把本标志置真，否则 ``Db.fts()`` 在构造期即抛
+    #: :class:`UnsupportedOperation`。
+    supports_fts: bool = False
+
     #: 是否支持 JSON 字段的路径查询。
     #:
     #: - SQLite / MySQL / PostgreSQL：True（实现下方方法即可）

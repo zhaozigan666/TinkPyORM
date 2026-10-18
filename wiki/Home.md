@@ -26,6 +26,7 @@
 | [05-原生表达式](05-原生表达式.md) | raw() 在 WHERE、UPDATE、字段片段中的用法与安全边界 |
 | [16-结果集与分页](16-结果集与分页.md) | Collection 行为与 Paginator 分页输出 |
 | [17-camelCase别名](17-camelCase别名.md) | 蛇形列名映射为驼峰输出的规则 |
+| [28-全文检索](28-全文检索.md) | FTS5 索引（external / standalone）、bm25 排序、高亮与摘要、中文 trigram |
 
 ## 写入
 

@@ -110,6 +110,9 @@ class Model(metaclass=MetaModel):
     __type__: Dict[str, Any] = {}   # 类型转换 {'id': 'int', 'tags': 'json'}
     __json__: List[str] = []        # JSON 字段（自动序列化/反序列化）
     __fields_cache__: Optional[List[str]] = None  # 表结构缓存（勿手改）
+    #: 全文检索配置（v0.10.0）：None 表示未启用，形如
+    #: ``{"columns": {"title": 5.0, "body": 1.0}, "tokenize": "trigram"}``
+    __fts__: Optional[dict] = None
 
     # ---- 实例属性（object.__setattr__ 直接写入，避免走 __setattr__） ---- #
     def __init__(self, data: Optional[dict] = None, exists: bool = False, **kwargs: Any):
@@ -347,6 +350,44 @@ class Model(metaclass=MetaModel):
         if cls.__json__:
             q.options["json"] = list(cls.__json__)
         return q
+
+    # ------------------------------------------------------------------ #
+    # 全文检索（v0.10.0，需声明 __fts__）
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def fts_index(cls):
+        """返回本模型的 FTS 索引门面（建索引/重建/维护入口）。
+
+        声明方式::
+
+            class Doc(Model):
+                __table__ = "docs"
+                __fts__ = {"columns": {"title": 5.0, "body": 1.0},
+                           "tokenize": "trigram"}
+
+            Doc.fts_index().create()      # 幂等建表 + 同步触发器
+        """
+        from .fts import FtsIndex
+        cfg = cls.__fts__
+        if not cfg:
+            raise QueryError(
+                f"{cls.__name__} 未声明 __fts__，无法使用全文检索")
+        return FtsIndex(cls._connection(),
+                        cls.__prefix__ + cls._table_name(),
+                        cfg.get("columns"),
+                        tokenize=cfg.get("tokenize", "trigram"),
+                        prefix=cfg.get("prefix"),
+                        standalone=bool(cfg.get("standalone", False)),
+                        content_rowid=cfg.get("content_rowid"),
+                        model=cls)
+
+    @classmethod
+    def search(cls, query: str):
+        """全文检索入口，返回绑定了本模型的检索链::
+
+            Doc.search("索引").rank().limit(10).select()   # Collection[Doc]
+        """
+        return cls.fts_index().search(query)
 
     @classmethod
     def _from_data(cls, data: dict) -> "Model":

@@ -23,6 +23,18 @@
 | 关联 | `with_` |
 | 其他 | `comment` `lock` `fetch_sql` `fail_exception` `allow_empty` `copy` `get_last_sql` |
 
+## FtsIndex / FtsQuery（全文检索，v0.10.0）
+
+入口：`Db.fts(name)`。详见 [28-全文检索](28-全文检索.md)。
+
+| 类别 | 方法 |
+|---|---|
+| 索引 | `create(rebuild=False)` `drop()` `rebuild()` `optimize()` `integrity_check()` `info()` |
+| 检索 | `search(query)` `select()` `first()` `count()` `to_sql()` |
+| 链式 | `rank([reverse])` `order(field[, direction])` `limit(n[, offset])` `page(p, n)` `where(*args, **kwargs)` `highlight(col[, open, close])` `snippet(col[, ...])` `cache(秒)` |
+| 工具 | `fts_quote(text)` |
+| 模型 | `Model.fts_index()` `Model.search(query)`（需声明 `__fts__`） |
+
 ## DocumentCollection（文档集合，v0.8.0）
 
 入口：`Db.collection(name)`。详见 [26-Collection文档集合](26-Collection文档集合.md)。
@@ -46,7 +58,7 @@
 
 ## Db（门面）
 
-`set_config` `get_connection` `close` `table` `name` `collection` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+`set_config` `get_connection` `close` `table` `name` `collection` `fts` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
 
 ## 配置键（set_config 一等键）
 

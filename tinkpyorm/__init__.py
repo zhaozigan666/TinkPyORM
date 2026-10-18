@@ -113,17 +113,19 @@ from .exceptions import (
     RelationNotFound, TransactionError, InvalidArgumentException,
     DriverNotAvailable,
 )
+from .fts import FtsIndex, FtsQuery, fts_quote, DEFAULT_TOKENIZE
 from .model import Model
 from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.9.2"
+__version__ = "0.10.0"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
     "DocumentCollection",
+    "FtsIndex", "FtsQuery", "fts_quote", "DEFAULT_TOKENIZE",
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore", "FileCacheStore",
     "JsonWhere", "JsonUpdate", "JSON_OPS", "JSON_UPDATE_MODES",

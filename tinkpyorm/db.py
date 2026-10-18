@@ -156,6 +156,32 @@ class Db:
         return Query(cls.get_connection(), prefix=cls._prefix).name(table)
 
     @classmethod
+    def fts(cls, name: str, columns: Any = None, *,
+            tokenize: str = "trigram", prefix: Any = None,
+            standalone: bool = False, content_rowid: Optional[str] = None,
+            model: Optional[type] = None) -> "FtsIndex":
+        """打开全文检索索引（SQLite FTS5，v0.10.0）。
+
+        默认 external 模式：索引只存词条，原文留在主表，create() 会自动
+        挂同步触发器；``standalone=True`` 则建独立 FTS 表（需显式给列）::
+
+            docs = Db.fts("docs")                       # 列自动从 docs 表推断
+            docs.create()                               # 幂等建表 + 触发器
+            docs.search("sqlite OR 索引").rank().limit(10).select()
+
+            notes = Db.fts("notes", ["title", "body"], standalone=True)
+            notes.create()
+
+        分词器默认 ``trigram``（中英文兼顾的子串检索，查询串需 ≥3 字符）。
+        详见 :class:`~tinkpyorm.fts.FtsIndex`。
+        """
+        from .fts import FtsIndex
+        return FtsIndex(cls.get_connection(), cls._prefix + name,
+                        columns, tokenize=tokenize, prefix=prefix,
+                        standalone=standalone, content_rowid=content_rowid,
+                        model=model)
+
+    @classmethod
     def raw(cls, expr: str) -> Raw:
         """原生 SQL 表达式包装。"""
         return raw(expr)

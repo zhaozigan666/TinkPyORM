@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinkpyorm"
-version = "0.9.2"
-description = "参考 think-orm 设计、纯标准库实现的 SQLite ORM（链式查询 / ActiveRecord / JSON 路径读写 / 文档集合）"
+version = "0.10.0"
+description = "参考 think-orm 设计、纯标准库实现的 SQLite ORM（链式查询 / ActiveRecord / JSON 路径读写 / 文档集合 / FTS5 全文检索）"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "MIT" }
