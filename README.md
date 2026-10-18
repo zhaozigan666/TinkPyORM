@@ -113,6 +113,12 @@ import sys; sys.path.insert(0, "/path/to/TinkPyORM")
 from tinkpyorm import Db, Model
 ```
 
+v0.9.2 起提供 `pyproject.toml`（零依赖、MIT），也可按标准方式安装：
+
+```bash
+pip install .
+```
+
 ---
 
 ## 快速开始
