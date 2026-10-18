@@ -815,7 +815,7 @@ class Query:
 
         rows = self._resolve_conn().query(sql, params)
         if cache_key:
-            _cache.store().set(cache_key, rows, ttl)
+            self._cache_set(cache_key, rows, ttl)
         result = self._build_result(rows)
         if self.options["fail_exception"] and len(result) == 0:
             raise DataNotFound("查询无结果")
@@ -847,7 +847,7 @@ class Query:
             if cache_key:
                 # 写入副本：find 的快路径会把 rows[0] 直接返回给调用方，
                 # 若缓存与返回值共享同一 dict，调用方的修改会污染缓存。
-                _cache.store().set(cache_key, [dict(r) for r in rows], ttl)
+                self._cache_set(cache_key, [dict(r) for r in rows], ttl)
 
         if not rows:
             if self.options["fail_exception"]:
@@ -999,7 +999,7 @@ class Query:
         if row is None:
             row = q._resolve_conn().query(sql, params)
             if cache_key:
-                _cache.store().set(cache_key, row, ttl)
+                q._cache_set(cache_key, row, ttl)
         if not row:
             return 0 if fn == "COUNT" else None
         return row[0][expr] if expr in row[0] else list(row[0].values())[0]
@@ -1521,6 +1521,18 @@ class Query:
                                    self._cache_table(), sql, params), ttl
         prefix = _cache.prefix_for(self._cache_database(), self._cache_table())
         return prefix + "user:" + key, ttl
+
+    def _cache_set(self, key: str, value: Any, ttl: float) -> None:
+        """写入查询缓存。
+
+        **事务进行中不写**：事务内的读取看到的是未提交状态，一旦回滚，
+        缓存里就会留下从未存在过的行（幻影读），且在 TTL 内无人清理。
+        命中侧不受影响——缓存中的条目永远来自已提交的快照。
+        """
+        conn = self._resolve_conn()
+        if getattr(conn, "_in_transaction", False):
+            return
+        _cache.store().set(key, value, ttl)
 
     def _invalidate_cache(self) -> int:
         """写操作后清除同一库同一表的全部缓存，返回清除条数。"""

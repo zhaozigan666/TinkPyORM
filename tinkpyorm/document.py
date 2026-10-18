@@ -50,7 +50,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .builder import JSON_OPS
-from .drivers import normalize_json_path
+from .drivers import UnsupportedOperation, normalize_json_path
 from .exceptions import InvalidArgumentException, QueryError
 from .query import Query
 from .utils import UNSET
@@ -90,6 +90,12 @@ class DocumentCollection:
         if not isinstance(name, str) or not _IDENT_RE.match(name.strip()):
             raise InvalidArgumentException(
                 f"非法集合名: {name!r}（须为字母/数字/下划线，且不以数字开头）")
+        driver = getattr(conn, "driver", None)
+        if driver is not None and not getattr(driver, "supports_document", False):
+            raise UnsupportedOperation(
+                f"{getattr(driver, 'name', '当前')} 驱动不支持文档集合："
+                f"该功能依赖 SQLite 的 table_xinfo / sqlite_master / 生成列，"
+                f"请改用 Query 链式查询，或为该驱动实现文档方言钩子")
         self.conn = conn
         self.name = name.strip()
         self.prefix = str(prefix or "")

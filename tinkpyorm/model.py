@@ -22,6 +22,21 @@ from .utils import UNSET as _UNSET, to_snake
 _GETTER_PREFIXES = ("get_", "set_", "on_", "scope_", "search_", "_")
 
 
+def _find_attr_hook(cls: type, name: str) -> Optional[Callable]:
+    """沿 MRO 直接查类字典，取出获取器/修改器方法。
+
+    不用 ``getattr(cls, name, None)``：未命中时会落入
+    :meth:`MetaModel.__getattr__`，那里会先构造一个 Query 再抛
+    AttributeError，单次探测约 45 µs。本函数只读 ``__dict__``，
+    不触发元类回退；代价是一次 MRO 遍历（通常 2 层）。
+    """
+    for c in cls.__mro__:
+        fn = c.__dict__.get(name)
+        if fn is not None:
+            return fn
+    return None
+
+
 class MetaModel(type):
     """模型元类：
 
@@ -32,6 +47,10 @@ class MetaModel(type):
 
     def __getattr__(cls, name: str) -> Any:
         if name.startswith("_") or name.startswith("scope_"):
+            raise AttributeError(f"type object {cls.__name__!r} has no attribute {name!r}")
+        # 获取器/修改器探测（get_xxx_attr / set_xxx_attr）不参与查询代理：
+        # 未定义时直接报错，避免为一次探测构造整条 Query。
+        if name.startswith(("get_", "set_")) and name.endswith("_attr"):
             raise AttributeError(f"type object {cls.__name__!r} has no attribute {name!r}")
         snake = to_snake(name)
         # 1) camelCase -> snake_case 同名方法（基于 MRO 直查，避免递归）
@@ -164,7 +183,7 @@ class Model(metaclass=MetaModel):
 
     def __getattr__(self, name: str) -> Any:
         # 获取器兜底（字段不存在时）
-        getter = getattr(type(self), f"get_{name}_attr", None)
+        getter = _find_attr_hook(type(self), f"get_{name}_attr")
         if getter is not None:
             return getter(self, None)
         # 空模型/未加载字段：对齐 think-orm 语义返回 None（仅普通字段名，
@@ -216,7 +235,7 @@ class Model(metaclass=MetaModel):
     # ------------------------------------------------------------------ #
     def set_attr(self, name: str, value: Any) -> None:
         """设置属性（应用 set_xxx_attr 修改器，记录变更）。"""
-        setter = getattr(type(self), f"set_{name}_attr", None)
+        setter = _find_attr_hook(type(self), f"set_{name}_attr")
         if setter is not None:
             value = setter(self, value)
         self._data[name] = value
@@ -232,7 +251,7 @@ class Model(metaclass=MetaModel):
         if name not in self._data:
             return None
         value = self._deserialize(name, self._data[name])
-        getter = getattr(type(self), f"get_{name}_attr", None)
+        getter = _find_attr_hook(type(self), f"get_{name}_attr")
         if getter is not None:
             value = getter(self, value)
         return value

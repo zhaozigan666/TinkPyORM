@@ -27,6 +27,7 @@ class SQLiteDriver(SQLDriver):
 
     name = "sqlite"
     paramstyle = "qmark"
+    supports_document = True   # 文档集合依赖 table_xinfo / sqlite_master / 生成列
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)

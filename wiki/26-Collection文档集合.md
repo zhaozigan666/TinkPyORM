@@ -122,7 +122,7 @@ docs.schema({"age": int, "name": str, "tags": list})
 2. **类型比较语义**：路径条件按 JSON 原生类型比较（数字对数字、文本对文本）。存入 `"17"`（字符串）不会命中 `where("age", 17)`——需要类型一致性时开启 schema 校验或声明 `sql_type`。
 3. **整文档替换的代价**：`update` 重写整个 `data` 列；局部改动用 `update_path` / `patch`。
 4. **update / delete 需要条件**：与 `Query` 一致，无条件写操作会报错；全表更新可用 `where("_id", ">", 0)` 显式表达。
-5. **MySQL 支持**：当前实现基于 SQLite JSON1 与生成列；驱动抽象层与 JSON 扩展点已预留多库形态，MySQL 未在承诺范围内。
+5. **仅 SQLite 可用**：实现依赖 `PRAGMA table_xinfo`、`sqlite_master` 的 DDL 文本与生成列，因此驱动必须声明 `supports_document = True`（当前仅 `SQLiteDriver`）。其它驱动调用 `Db.collection()` 会在构造阶段抛 `UnsupportedOperation`，不会运行到一半才失败。
 6. **与结果集 Collection 的命名**：导入时注意 `from tinkpyorm import DocumentCollection`（文档集合）与 `Collection`（结果集）是两个类。
 
 ## API 速览

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tinkpyorm"
+version = "0.9.2"
+description = "参考 think-orm 设计、纯标准库实现的 SQLite ORM（链式查询 / ActiveRecord / JSON 路径读写 / 文档集合）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [{ name = "TinkPyORM contributors" }]
+keywords = ["orm", "sqlite", "think-orm", "query-builder", "json", "schemaless"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/zhaozigan666/TinkPyORM"
+Documentation = "https://github.com/zhaozigan666/TinkPyORM/wiki"
+
+[tool.setuptools]
+packages = ["tinkpyorm", "tinkpyorm.drivers"]

@@ -4,7 +4,7 @@
 
 **一个用纯 Python 标准库实现的 SQLite ORM，API 设计参考 ThinkPHP 的 think-orm v4.0**
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.8%20%7C%203.15-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(zero)-brightgreen.svg)](#零依赖)
 [![Backend](https://img.shields.io/badge/database-SQLite-lightgrey.svg)](https://www.sqlite.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](#许可证)
@@ -79,10 +79,21 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 ## 零依赖
 
 ```
-Python 3.8+ 标准库：sqlite3, json, datetime, contextlib, collections, re, typing, threading
+Python 3.8–3.15 标准库：sqlite3, json, datetime, contextlib, collections, re, typing, threading
 ```
 
 **不需要** SQLAlchemy、不需要 Peewee、不需要任何 `pip install`。
+
+**Python 版本支持**（每个版本均跑完整测试套件实测）：
+
+| 版本 | 状态 | 说明 |
+|---|---|---|
+| 3.8 / 3.9 | ✅ 461 项 + 174 示例通过 | 已 EOL，仅保证兼容、不再跟进修复 |
+| 3.10 / 3.11 | ✅ 461 项 + 174 示例通过 | — |
+| 3.12 / 3.13 / 3.14 | ✅ 461 项 + 174 示例通过 | — |
+| 3.15 | ✅ 3.15.0rc2 全套通过 | 另跑 `-W error::DeprecationWarning` 无告警 |
+
+`pyproject.toml` 声明 `requires-python = ">=3.8"`；新项目建议 3.11 及以上。
 
 ---
 
@@ -201,6 +212,17 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.9.2
+
+模型层热路径与缓存一致性修复，补齐版本支持声明。
+
+- 修复 `Model` 属性访问被元类回退拖慢：获取器/修改器探测（`get_xxx_attr` / `set_xxx_attr`）未命中时会落入 `MetaModel.__getattr__` 并构造整条 Query。改为 MRO 直查后，单次字段读取 **53.4 µs → 8.3 µs**（6.4 倍），5000 行"查 + 读"从 **310 ms 降到 82 ms**（3.8 倍）
+- 修复查询缓存与事务不协同导致的**幻影读**：事务内的读取不再写入缓存；事务提交与回滚后按库级前缀清除缓存，未提交数据不会再存活到 TTL 结束
+- 新增 `Driver.supports_document` 能力标志；非 SQLite 驱动调用 `Db.collection()` 时快速失败并给出明确提示（文档集合依赖 `table_xinfo` / `sqlite_master` / 生成列）
+- 新增 `pyproject.toml`（`requires-python = ">=3.8"`、8 个版本的 classifiers、MIT、零依赖）
+- 新增 `cache.prefix_for_database()`；`test_cache.py` 44 → 47 项、`test_drivers.py` 16 → 17 项、`test_collection.py` 59 → 60 项，合计 **461 项单元测试 + 174 项示例**通过
+- Python 3.8 / 3.9 / 3.10 / 3.11 / 3.12 / 3.13 / 3.14 / 3.15（rc2）逐版本实测通过
 
 ### v0.9.1
 

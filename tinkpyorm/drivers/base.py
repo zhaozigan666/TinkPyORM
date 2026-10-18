@@ -223,6 +223,14 @@ class Driver(abc.ABC):
     # ------------------------------------------------------------------ #
     # JSON 能力（可选）
     # ------------------------------------------------------------------ #
+    #: 是否支持"文档集合"（:class:`~tinkpyorm.document.DocumentCollection`）。
+    #:
+    #: 文档集合依赖三道 SQLite 专有能力：``PRAGMA table_xinfo`` 读列、
+    #: ``sqlite_master`` 的 DDL 文本充当提升列注册表、生成列（GENERATED）。
+    #: 其它驱动在没有实现对应方言钩子前必须保持 False，由 ``Db.collection``
+    #: 快速失败并给出明确提示，而不是运行到一半抛 "no such table"。
+    supports_document: bool = False
+
     #: 是否支持 JSON 字段的路径查询。
     #:
     #: - SQLite / MySQL / PostgreSQL：True（实现下方方法即可）

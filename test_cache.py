@@ -509,5 +509,43 @@ class TestFileCacheWiring(unittest.TestCase):
                            "cache_backend": "redis", "cache_dir": self.dir})
 
 
+class TestTransactionCache(unittest.TestCase):
+    """缓存与事务的协同（v0.9.2）：未提交数据不得进入缓存。"""
+
+    def setUp(self):
+        self.conn = _setup_table()
+
+    def tearDown(self):
+        Db.clear_cache()
+
+    def test_read_inside_transaction_does_not_populate_cache(self):
+        """事务内读取不进缓存：缓存里只允许存在已提交的快照。"""
+        self.conn.begin()
+        try:
+            Db.table("data").cache(30).select()
+            self.assertEqual(len(cache.store()), 0)
+        finally:
+            self.conn.rollback()
+
+    def test_rollback_drops_phantom_rows(self):
+        """事务内新增的行，回滚后不得从缓存读到。"""
+        self.conn.begin()
+        try:
+            Db.table("data").insert({"url": "tmp", "v": 99})
+            rows = Db.table("data").cache(30).select()
+            self.assertIn("tmp", [r["url"] for r in rows])   # 事务内直接读库
+        finally:
+            self.conn.rollback()
+        rows = Db.table("data").cache(30).select()
+        self.assertNotIn("tmp", [r["url"] for r in rows])
+
+    def test_commit_invalidates_pre_commit_snapshot(self):
+        """提交前的旧快照不能活到提交之后。"""
+        before = Db.table("data").cache(30).count()
+        with self.conn.transaction():
+            Db.table("data").insert({"url": "new", "v": 7})
+        self.assertEqual(Db.table("data").cache(30).count(), before + 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

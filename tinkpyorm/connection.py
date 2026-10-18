@@ -257,8 +257,14 @@ class Connection:
             try:
                 yield self
                 self.driver.commit()
+                # 事务期间可能被其它线程读走"提交前"的快照并写入缓存，
+                # 提交后必须整体失效，否则这段竞态窗口内的旧值会存活到 TTL 结束。
+                self._clear_cache()
             except BaseException:
                 self.driver.rollback()
+                # 回滚：事务内的读取（若缓存写入未被挡住）或并发读取都可能
+                # 留下未提交数据的快照，整库前缀清一次最安全。
+                self._clear_cache()
                 raise
             finally:
                 self._in_transaction = False
@@ -284,6 +290,16 @@ class Connection:
                 raise TransactionError("当前没有进行中的事务")
             self.driver.rollback()
             self._in_transaction = False
+            self._clear_cache()
+
+    def _clear_cache(self) -> None:
+        """清空本库的查询缓存（事务结束后的兜底失效）。
+
+        粒度是"库"而非"表"：事务回滚时无法廉价枚举本次碰过哪些表，
+        宁可误伤同库其它表的有效缓存，也不能留下未提交数据的幻影行。
+        """
+        from . import cache as _cache
+        _cache.clear(_cache.prefix_for_database(self.config.database))
 
     @staticmethod
     def _render(sql: str, params: Sequence[Any]) -> str:

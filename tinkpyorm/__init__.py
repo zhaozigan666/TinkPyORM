@@ -118,7 +118,7 @@ from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 
 __all__ = [

@@ -59,6 +59,11 @@ class TestDriverAbstraction(unittest.TestCase):
         cls = get_driver("sqlite")
         self.assertTrue(issubclass(cls, Driver))
 
+    def test_document_capability_flag(self):
+        """文档集合能力标志（v0.9.2）：基类默认 False，SQLite 显式声明 True。"""
+        self.assertFalse(Driver.supports_document)
+        self.assertTrue(get_driver("sqlite").supports_document)
+
     def test_unknown_driver_raises(self):
         with self.assertRaises(DriverNotAvailable):
             get_driver("oracle")

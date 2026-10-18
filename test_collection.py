@@ -433,5 +433,25 @@ class TestEdges(unittest.TestCase):
         self.assertEqual(other.table, "other")
 
 
+class TestDriverCapability(unittest.TestCase):
+    """文档集合的驱动能力边界（v0.9.2）：不支持的驱动必须快速失败。"""
+
+    def test_rejects_driver_without_document_support(self):
+        from tinkpyorm import Connection, SQLiteDriver, register_driver
+        from tinkpyorm.config import Config
+        from tinkpyorm.drivers import _DRIVERS, UnsupportedOperation
+
+        class _NoDocDriver(SQLiteDriver):
+            name = "no_doc"
+            supports_document = False
+
+        register_driver("no_doc")(_NoDocDriver)
+        self.addCleanup(_DRIVERS.pop, "no_doc", None)
+        conn = Connection.from_config(Config(database=":memory:", type="no_doc"))
+        with self.assertRaises(UnsupportedOperation) as ctx:
+            DocumentCollection(conn, "docs")
+        self.assertIn("不支持文档集合", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

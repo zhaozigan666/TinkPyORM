@@ -31,7 +31,8 @@ from .exceptions import InvalidArgumentException
 __all__ = [
     "CacheStore", "MemoryCacheStore", "FileCacheStore",
     "DEFAULT_MAX_ITEMS", "SEPARATOR",
-    "store", "set_store", "clear", "make_key", "prefix_for", "stats",
+    "store", "set_store", "clear", "make_key", "prefix_for",
+    "prefix_for_database", "stats",
 ]
 
 #: 默认条目上限（超出按 LRU 淘汰）
@@ -369,6 +370,19 @@ def stats() -> Dict[str, Any]:
 def prefix_for(database: Optional[str], table: Optional[str]) -> str:
     """构造"库 + 表"层级前缀，用于写操作后的精确失效。"""
     return f"{database or ''}{SEPARATOR}{table or ''}{SEPARATOR}"
+
+
+def prefix_for_database(database: Optional[str]) -> str:
+    """构造库级前缀（只到库名，不含表名）。
+
+    用于事务回滚等"无法廉价枚举涉及表"的场景：清掉该库下所有表的缓存，
+    粒度为库而不是表，代价是可能误伤同库其它表的有效缓存，但保证不会
+    留下未提交数据的幻影行。
+
+    注意不能用 ``prefix_for(database, None)``：那会得到
+    ``"db\\x00\\x00"``，匹配不到 ``"db\\x00user\\x00<hash>"``。
+    """
+    return f"{database or ''}{SEPARATOR}"
 
 
 def make_key(database: Optional[str], table: Optional[str],
