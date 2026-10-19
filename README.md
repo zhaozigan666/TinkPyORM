@@ -19,7 +19,7 @@
 
 **本文件**：[简介](#简介) · [特性](#特性) · [零依赖](#零依赖) · [安装](#安装) · [快速开始](#快速开始) · [更新记录](#更新记录) · [致谢与灵感来源](#致谢与灵感来源) · [许可证](#许可证)
 
-**技术文档**：共 29 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
+**技术文档**：共 30 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
 
 ---
 
@@ -71,6 +71,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **JSON 自动建表模式** —— `Db.set_config({"json": True})` 后，`Db.table()` / `Db.name()` 遇到不存在的表自动创建（`id` 自增主键），插入 dict 数据缺失字段自动加列（按值推断类型，dict/list 存 JSON 文本），`insert_all` 支持异构行并集补 `None`
 - **查询缓存** —— `cache(秒)` TTL 缓存，写操作自动失效；后端可选进程内存或本地文件（落盘持久、多进程共享）
 - **全文检索（FTS5）** —— `Db.fts(name)` 建 FTS5 索引：external 模式自动挂增删改触发器，`search()` 支持布尔 / 短语 / 列过滤 / 前缀 / NEAR，`rank()` 按 bm25 加权相关度排序，`highlight()` / `snippet()` 取高亮与摘要；默认 `trigram` 分词中英文兼顾；模型可声明 `__fts__` 后用 `Model.search()` 直接拿模型实例
+- **MySQL 5.7 / 8.x / 9.x 方言** —— `Db.config(type="mysql", version="8.0.36", ...)` 指定版本（缺省按 5.7）；按版本启用/禁用 CTE、`SKIP LOCKED`、`JSON_MERGE_PATCH`、upsert 行别名等语法，无等价写法时给出"需要 >= x"的明确报错；JSON 类型词汇跨库归一、`utf8mb4` 显式指定、服务端游标流式读取
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
 - **调试友好** —— SQL 日志、`fetch_sql`、最后一条 SQL 查询
@@ -83,7 +84,8 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 Python 3.8–3.15 标准库：sqlite3, json, datetime, contextlib, collections, re, typing, threading
 ```
 
-**不需要** SQLAlchemy、不需要 Peewee、不需要任何 `pip install`。
+**不需要** SQLAlchemy、不需要 Peewee、不需要任何 `pip install`（SQLite 路径）。
+MySQL 驱动是**可选依赖**：`pip install ".[mysql]"`（或 `pip install pymysql`）。
 
 **Python 版本支持**（每个版本均跑完整测试套件实测）：
 
@@ -117,7 +119,8 @@ from tinkpyorm import Db, Model
 v0.9.2 起提供 `pyproject.toml`（零依赖、MIT），也可按标准方式安装：
 
 ```bash
-pip install .
+pip install .                 # SQLite（零依赖）
+pip install ".[mysql]"        # 追加 MySQL 驱动（pymysql）
 ```
 
 ---
@@ -170,6 +173,7 @@ User.destroy(user.id)                                  # 删除
 - [01-连接配置](wiki/01-连接配置.md) —— 字典 / 路径 / Connection 三种配置方式、驱动与连接参数
 - [26-Collection文档集合](wiki/26-Collection文档集合.md) —— schemaless 文档存储：CRUD、路径条件、字段提升与索引、schema 校验
 - [27-JSON自动建表](wiki/27-JSON自动建表.md) —— `json: True` 模式：Db.table/Db.name 自动建表、缺失字段自动加列、类型推断
+- [29-MySQL支持](wiki/29-MySQL支持.md) —— MySQL 5.7 / 8.x / 9.x：版本配置、差异矩阵、版本门禁与降级输出
 
 **查询**
 
@@ -220,6 +224,20 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.11.0
+
+MySQL 5.7 / 8.x / 9.x 方言与版本门禁。
+
+- 新增 `tinkpyorm/drivers/mysql.py`：pymysql 连接、`%s` 占位符、反引号标识符、`information_schema` 元数据、服务端游标流式读取、JSON 方言
+- 新增 `version` 一等配置键：`Db.config({"type": "mysql", "version": "8.0.36", ...})` 或 `Db.config(type="mysql", version="8.0", ...)`；缺省按 **5.7** 处理；`Db.config` 为 `Db.set_config` 的别名
+- 新增 `tinkpyorm/versioning.py`：版本解析（str/int/float/2~3 元组、忽略 `-` 发行版后缀）与支持范围校验（5.7.x / 8.0–8.4 / 9.x，越界直接报错）
+- 新增能力矩阵 `MYSQL_FEATURES` / `MYSQL_REMOVED` 与 `driver.supports_feature()` / `require_feature()` / `features()` / `dialect_info()`；9.0 移除的 `mysql_native_password` 也被建模
+- 新增 `Query.cte()`（>= 8.0.1）、`Query.upsert()`（全版本，8.0.19+ 用行别名、更早降级 `VALUES(col)`）；`lock("skip locked"/"nowait")` 增加 >= 8.0.1 门禁
+- JSON 方言：`JSON_CONTAINS` 候选值自动 `CAST(%s AS JSON)`；`JSON_TYPE` 用 `CASE` 归一为 SQLite 词汇（`text` / `real` / `true` / `false`）；`JSON_MERGE_PATCH` 门禁 5.7.22
+- 修正：Builder 中 13 处硬编码 `?` 占位符改为驱动占位符（MySQL `%s`）；`fetch_sql` 支持渲染 `%s`
+- 新增 `test_mysql.py`（47 项，离线 SQL/门禁测试）；合计 **558 项单元测试 + 174 项示例**通过
+- 新增 `wiki/29-MySQL支持.md`
 
 ### v0.10.0
 

@@ -147,7 +147,65 @@ class Query:
         return self
 
     def lock(self, flag: Union[bool, str] = True) -> "Query":
+        """行锁子句（``FOR UPDATE`` 系列）。
+
+        ``True`` → ``FOR UPDATE``；字符串原样拼入 SQL（保留逃生舱）。
+        对 ``nowait`` / ``skip locked`` 做**版本门禁**（v0.11.0）：
+        MySQL 需 >= 8.0.1，其它驱动不支持，能力不足时抛
+        ``UnsupportedOperation``，而不是生成一条执行时才报语法错误的 SQL。
+        """
+        if isinstance(flag, str):
+            norm = " ".join(flag.strip().lower().split())
+            if norm in ("update", "for update"):
+                flag = "FOR UPDATE"
+            elif norm in ("nowait", "for update nowait"):
+                self._resolve_conn().driver.require_feature("nowait")
+                flag = "FOR UPDATE NOWAIT"
+            elif norm in ("skip locked", "for update skip locked"):
+                self._resolve_conn().driver.require_feature("skip_locked")
+                flag = "FOR UPDATE SKIP LOCKED"
         self.options["lock"] = flag
+        return self
+
+    def cte(self, name: str, query: Any, columns: Optional[Sequence[str]] = None,
+            recursive: bool = False) -> "Query":
+        """追加一个公用表表达式（``WITH name AS (...)``，v0.11.0）。
+
+        ``query`` 可为 ``Query``（推荐，参数自动透传）、``Raw`` 或原生 SQL
+        字符串（信任调用方）。版本门槛由驱动回答：MySQL 需 >= 8.0.1，
+        SQLite / PostgreSQL 原生支持。
+
+        ::
+
+            sub = Db.table("order").field("user_id").where("status", 1)
+            rows = Db.table("user").cte("paid", sub).where_in("id", ...).select()
+
+        注意：``recursive=True`` 仅对原生 SQL 有意义（子查询无法引用自身），
+        生成的语句为 ``WITH RECURSIVE ...``。
+        """
+        conn = self._resolve_conn()
+        conn.driver.require_feature("cte")
+        if not isinstance(name, str) or not _AUTO_IDENT_RE.match(name.strip()):
+            raise InvalidArgumentException(
+                f"非法 CTE 名: {name!r}（须为字母/数字/下划线，且不以数字开头）")
+        if isinstance(query, Query):
+            sql, params = query.builder.select(query.options)
+        elif isinstance(query, Raw):
+            sql, params = query.value, []
+        elif isinstance(query, str):
+            sql, params = query, []
+        else:
+            raise InvalidArgumentException(
+                f"CTE 子查询须为 Query/Raw/SQL 字符串，收到: {type(query).__name__}")
+        entry = {"name": name.strip(), "sql": sql, "params": list(params)}
+        if columns:
+            for col in columns:
+                if not isinstance(col, str) or not _AUTO_IDENT_RE.match(col):
+                    raise InvalidArgumentException(f"非法 CTE 列名: {col!r}")
+            entry["columns"] = list(columns)
+        self.options.setdefault("cte", []).append(entry)
+        if recursive:
+            self.options["cte_recursive"] = True
         return self
 
     # ------------------------------------------------------------------ #
@@ -1033,6 +1091,34 @@ class Query:
         self._invalidate_cache()
         return last_id
 
+    def upsert(self, data: Optional[dict] = None,
+               update: Optional[Sequence[str]] = None) -> int:
+        """插入或（主键/唯一键冲突时）更新，返回影响行数（MySQL，v0.11.0）。
+
+        ::
+
+            Db.table("user").upsert({"id": 1, "name": "x"}, update=["name"])
+
+        SQL 形态随 MySQL 版本降级：>= 8.0.19 用行别名 ``AS new``，
+        更早版本退化为 ``VALUES(col)``。非 MySQL 驱动在编译前即拒绝
+        （SQLite 的 ``ON CONFLICT`` 需要显式冲突目标，语义无法一一对应）。
+
+        ``update`` 省略时更新除 ``id`` 外的所有列。
+        """
+        if data is None:
+            data = self.options.get("data") or {}
+        if not data:
+            raise QueryError("upsert 数据不能为空")
+        conn = self._resolve_conn()
+        self._auto_json_ensure([data])
+        sql, params = self.builder.upsert(self.options, data, update)
+        self._last_sql, self._last_params = sql, params
+        if self.options["fetch_sql"]:
+            return conn_render(sql, params)
+        affected = conn.execute(sql, params)
+        self._invalidate_cache()
+        return affected
+
     def insert_all(self, data_list: List[dict], batch_size: Optional[int] = None) -> int:
         """批量插入，返回插入行数。
 
@@ -1636,18 +1722,42 @@ def _plain_json_decode(value: Any) -> Any:
 
 
 def conn_render(sql: str, params: Sequence[Any]) -> str:
-    """把 SQL 与参数渲染为可读字符串（仅供调试，不用于执行）。"""
+    """把 SQL 与参数渲染为可读字符串（仅供调试，不用于执行）。
+
+    兼容两种占位符：SQLite 的 ``?`` 与 MySQL 的 ``%s``。按 SQL 内容判断，
+    避免为渲染函数再引入一个驱动参数（本函数只用于日志/``fetch_sql``）。
+    """
+    if "%s" in sql and "?" not in sql:
+        return _render_format_params(sql, params)
     out, idx = [], 0
     for ch in sql:
         if ch == "?" and idx < len(params):
-            p = params[idx]
+            out.append(_render_param(params[idx]))
             idx += 1
-            if p is None:
-                out.append("NULL")
-            elif isinstance(p, (int, float)):
-                out.append(str(p))
-            else:
-                out.append("'" + str(p).replace("'", "''") + "'")
         else:
             out.append(ch)
+    return "".join(out)
+
+
+def _render_param(value: Any) -> str:
+    if value is None:
+        return "NULL"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _render_format_params(sql: str, params: Sequence[Any]) -> str:
+    out, idx, i = [], 0, 0
+    while i < len(sql):
+        if sql.startswith("%s", i) and idx < len(params):
+            out.append(_render_param(params[idx]))
+            idx += 1
+            i += 2
+        elif sql.startswith("%%", i):
+            out.append("%")
+            i += 2
+        else:
+            out.append(sql[i])
+            i += 1
     return "".join(out)

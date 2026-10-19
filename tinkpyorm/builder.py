@@ -180,7 +180,31 @@ class Builder:
             sql_parts.append("FOR UPDATE" if options["lock"] is True else str(options["lock"]))
 
         sql = " ".join(sql_parts)
-        return sql, join_params + where_params + having_params + union_params
+        cte_prefix, cte_params = self._build_cte(options)
+        return (cte_prefix + sql,
+                cte_params + join_params + where_params
+                + having_params + union_params)
+
+    def _build_cte(self, options: dict) -> Tuple[str, list]:
+        """编译 ``WITH name [(cols)] AS (子查询), ...`` 前缀（v0.11.0）。
+
+        CTE 的参数位于整个语句最前，故单独返回并在调用处前置。
+        版本门槛由 ``Query.cte()`` 在加入选项时校验，这里只负责拼装。
+        """
+        items = options.get("cte") or []
+        if not items:
+            return "", []
+        parts: List[str] = []
+        params: list = []
+        for item in items:
+            cols = ""
+            if item.get("columns"):
+                cols = " (" + ", ".join(
+                    self._qi(c) for c in item["columns"]) + ")"
+            parts.append(f"{self._qi(item['name'])}{cols} AS ({item['sql']})")
+            params.extend(item.get("params") or [])
+        return ("WITH " + ("RECURSIVE " if options.get("cte_recursive") else "")
+                + ", ".join(parts) + " ", params)
 
     def _build_table(self, options: dict) -> str:
         table = options.get("table")
@@ -337,7 +361,7 @@ class Builder:
         if value is None:
             return f"{field_sql} IS NULL", []
         # 5) 等于
-        return f"{field_sql} = ?", [value]
+        return f"{field_sql} = {self.conn.driver.placeholder(1)}", [value]
 
     def _parse_op(self, field_sql: str, op: str, value: Any) -> Tuple[str, list]:
         op = op.lower()
@@ -347,11 +371,11 @@ class Builder:
             return f"{field_sql} {sql_op} {value.value}", []
         if op in ("=", "!=", "<>", ">", "<", ">=", "<="):
             sql_op = "<>" if op == "<>" else op.upper()
-            return f"{field_sql} {sql_op} ?", [value]
+            return f"{field_sql} {sql_op} {self.conn.driver.placeholder(1)}", [value]
         if op == "like":
-            return f"{field_sql} LIKE ?", [value]
+            return f"{field_sql} LIKE {self.conn.driver.placeholder(1)}", [value]
         if op == "not like":
-            return f"{field_sql} NOT LIKE ?", [value]
+            return f"{field_sql} NOT LIKE {self.conn.driver.placeholder(1)}", [value]
         if op == "in":
             if not value:
                 return "1 = 0", []
@@ -363,22 +387,25 @@ class Builder:
             marks = self.conn.driver.placeholder(len(value))
             return f"{field_sql} NOT IN ({marks})", list(value)
         if op == "between":
-            return f"{field_sql} BETWEEN ? AND ?", list(value)
+            return (f"{field_sql} BETWEEN {self.conn.driver.placeholder(1)} "
+                    f"AND {self.conn.driver.placeholder(1)}", list(value))
         if op == "not between":
-            return f"{field_sql} NOT BETWEEN ? AND ?", list(value)
+            return (f"{field_sql} NOT BETWEEN {self.conn.driver.placeholder(1)} "
+                    f"AND {self.conn.driver.placeholder(1)}", list(value))
         if op == "is":
             if value is None:
                 return f"{field_sql} IS NULL", []
-            return f"{field_sql} IS ?", [value]
+            return f"{field_sql} IS {self.conn.driver.placeholder(1)}", [value]
         if op == "is not":
             if value is None:
                 return f"{field_sql} IS NOT NULL", []
-            return f"{field_sql} IS NOT ?", [value]
+            return f"{field_sql} IS NOT {self.conn.driver.placeholder(1)}", [value]
         if op in ("exp", "raw"):
             expr = value.value if is_raw(value) else value
             return f"{field_sql} {expr}", []
         if op == "find_in_set":
-            return f"FIND_IN_SET(?, {field_sql})", [value]
+            return (f"FIND_IN_SET({self.conn.driver.placeholder(1)}, "
+                    f"{field_sql})", [value])
         if op == "exists":
             return self._exists_sql("EXISTS", value)
         if op == "not exists":
@@ -432,8 +459,8 @@ class Builder:
         if op in ("contains", "not contains"):
             expr = driver.json_contains(col, path, driver.placeholder(1))
             if op == "contains":
-                return expr, [self._json_scalar(value)]
-            return f"NOT {expr}", [self._json_scalar(value)]
+                return expr, [driver.json_contains_value(value)]
+            return f"NOT {expr}", [driver.json_contains_value(value)]
 
         lhs = self._json_lhs(driver, col, path, jw.func)
 
@@ -452,16 +479,18 @@ class Builder:
             if not isinstance(value, (list, tuple)) or len(value) != 2:
                 raise QueryError("JSON between 条件需要 [下限, 上限] 两个值")
             keyword = "BETWEEN" if op == "between" else "NOT BETWEEN"
-            return (f"{lhs} {keyword} ? AND ?",
+            return (f"{lhs} {keyword} {driver.placeholder(1)} "
+                    f"AND {driver.placeholder(1)}",
                     [self._json_scalar(value[0]), self._json_scalar(value[1])])
 
         # 5) 模糊匹配与标量比较
         if op in ("like", "not like"):
             keyword = "LIKE" if op == "like" else "NOT LIKE"
-            return f"{lhs} {keyword} ?", [value]
+            return f"{lhs} {keyword} {driver.placeholder(1)}", [value]
 
         sql_op = "<>" if op == "<>" else op.upper()
-        return f"{lhs} {sql_op} ?", [self._json_scalar(value)]
+        return (f"{lhs} {sql_op} {driver.placeholder(1)}",
+                [self._json_scalar(value)])
 
     @staticmethod
     def _json_lhs(driver: Any, column_sql: str, path: Any,
@@ -754,6 +783,46 @@ class Builder:
         sql = f"INSERT INTO {table} ({cols}) VALUES {', '.join(rows_sql)}"
         return sql, params
 
+    def upsert(self, options: dict, data: dict,
+               update: Optional[Sequence[str]] = None) -> Tuple[str, list]:
+        """编译 ``INSERT ... ON DUPLICATE KEY UPDATE``（v0.11.0，MySQL）。
+
+        版本差异由驱动吸收：
+
+        - MySQL >= 8.0.19：``VALUES (...) AS new`` + ``col = new.col``
+          （``VALUES(col)`` 自 8.0.20 起弃用）；
+        - MySQL < 8.0.19：降级为 ``col = VALUES(col)``，功能等价。
+
+        其它驱动没有该语义（SQLite 的 ``ON CONFLICT`` 需要冲突目标），
+        在编译前即抛 ``UnsupportedOperation``。
+        """
+        driver = self.conn.driver
+        if not getattr(driver, "supports_upsert", False):
+            raise UnsupportedOperation(
+                f"{driver.name or '当前'} 驱动不支持 upsert（ON DUPLICATE KEY UPDATE）")
+        table = self._build_table(options)
+        fields = list(data)
+        if not fields:
+            raise QueryError("upsert 数据不能为空")
+        targets = list(update) if update else [f for f in fields
+                                               if f.lower() != "id"]
+        if not targets:
+            raise QueryError("upsert 需要至少一个更新列（可显式传 update=[...]）")
+        unknown = [c for c in targets if c not in fields]
+        if unknown:
+            raise QueryError("upsert 的更新列必须出现在数据中："
+                             + ", ".join(unknown))
+        cols = ", ".join(driver.quote_identifier(f) for f in fields)
+        marks = driver.placeholder(len(fields))
+        params = [driver.json_encode(data[f]) for f in fields]
+        alias = " AS new" if driver.supports_feature("values_alias") else ""
+        sets = ", ".join(
+            f"{driver.quote_identifier(c)} = {driver.upsert_values_ref(c)}"
+            for c in targets)
+        sql = (f"INSERT INTO {table} ({cols}) VALUES ({marks}){alias} "
+               f"ON DUPLICATE KEY UPDATE {sets}")
+        return sql, params
+
     def update(self, options: dict, data: dict) -> Tuple[str, list]:
         """编译 UPDATE 语句。
 
@@ -776,7 +845,8 @@ class Builder:
             if is_raw(value):
                 set_sql.append(f"{self._qi(field)} = {value.value}")
             else:
-                set_sql.append(f"{self._qi(field)} = ?")
+                set_sql.append(
+                    f"{self._qi(field)} = {self.conn.driver.placeholder(1)}")
                 set_params.append(self.conn.driver.json_encode(value))
         if specs:
             json_sql, json_params = self._build_json_update(specs)

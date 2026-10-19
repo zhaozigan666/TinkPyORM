@@ -19,6 +19,7 @@ from .config import Config
 from .connection import (
     Connection, get_default_connection, set_default_connection,
 )
+from .exceptions import InvalidArgumentException
 from .query import Query
 from .utils import Raw, raw
 
@@ -43,16 +44,22 @@ class Db:
     # 配置与连接
     # ------------------------------------------------------------------ #
     @classmethod
-    def set_config(cls, config: Union[dict, Connection, str],
-                   name: str = "default") -> Connection:
+    def set_config(cls, config: Union[dict, Connection, str, None] = None,
+                   name: str = "default", **kwargs: Any) -> Connection:
         """设置数据库配置（一次配置、全局共享）。
 
         支持::
 
             Db.set_config({'database': 'app.db'})                 # dict 配置
-            Db.set_config({'type': 'mysql', ...})                 # 指定驱动（v0.3.0+ 预留）
+            Db.set_config({'type': 'mysql', 'version': '8.0.36',  # 指定驱动与版本
+                           'host': '127.0.0.1', 'database': 'app'})
+            Db.set_config(type='mysql', version='8.0',            # 直接传参
+                          host='127.0.0.1', database='app')
             Db.set_config(Connection('app.db'))                   # 直接传入连接
             Db.set_config('app.db')                               # SQLite 文件路径
+
+        ``version`` 是 v0.11.0 起的一等配置键（仅 MySQL 消费，缺省按 5.7 处理，
+        解析与校验见 :mod:`tinkpyorm.versioning`）。位置配置与关键字参数不可混用。
 
         修复性行为（相对 v0.2.0）：
         * 未知配置键归入驱动 options，不再透传底层驱动引发 TypeError；
@@ -60,6 +67,14 @@ class Db:
           注册表为准，故 ``register_driver("oracle", OracleDriver)`` 之后
           ``{'type': 'oracle'}`` 即为合法配置（v0.7.1 起）。
         """
+        if kwargs:
+            if config is not None:
+                raise InvalidArgumentException(
+                    "set_config 的位置配置与关键字参数不能混用")
+            config = kwargs
+        if config is None:
+            raise InvalidArgumentException("set_config 需要配置字典/连接/路径")
+
         if isinstance(config, Connection):
             conn = config
             cls._connections[name] = conn
@@ -79,6 +94,17 @@ class Db:
         if name == cls._default_name:
             set_default_connection(conn)
         return conn
+
+    @classmethod
+    def config(cls, config: Union[dict, Connection, str, None] = None,
+               name: str = "default", **kwargs: Any) -> Connection:
+        """``set_config`` 的别名（v0.11.0）。
+
+        保留两个名字是因为版本号等新配置项常被写在
+        ``Db.config(type="mysql", version="8.0.36", ...)`` 这种"配置"语义
+        的调用里；两者完全等价，共享同一份连接注册表。
+        """
+        return cls.set_config(config, name=name, **kwargs)
 
     @classmethod
     def _apply_cache_config(cls, config: dict) -> None:

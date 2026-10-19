@@ -51,6 +51,7 @@ KNOWN_TYPES = frozenset(TYPE_ALIASES.values())
 COMMON_KEYS = frozenset({
     "name", "type", "driver", "database", "dsn", "prefix",
     "host", "port", "user", "username", "password", "options",
+    "version",
     "sql_log_enabled", "sql_log_max", "connect_timeout", "path_expand",
     "collection_schema_mode", "json",
     "cache_backend", "cache_dir",
@@ -150,6 +151,11 @@ class Config:
     user: Optional[str] = None
     password: Optional[str] = None
     prefix: str = ""
+    #: 数据库产品版本（v0.11.0）。仅 MySQL 消费：``"5.7"`` / ``"8.0.36"`` /
+    #: ``"9.1"``，缺省按 5.7 处理；SQLite 忽略本字段（版本由运行时决定）。
+    #: 接受 str / int / float / (major, minor[, patch])，解析规则见
+    #: :mod:`tinkpyorm.versioning`。
+    version: Optional[Any] = None
     #: 驱动专属参数（如 SQLite 的 timeout/journal_mode，MySQL 的 charset）
     options: Dict[str, Any] = field(default_factory=dict)
     sql_log_enabled: bool = True

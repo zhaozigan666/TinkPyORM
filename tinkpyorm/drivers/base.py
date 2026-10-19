@@ -17,7 +17,7 @@ import re
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 from ..config import Config
-from ..exceptions import InvalidArgumentException, OrmError
+from ..exceptions import InvalidArgumentException, OrmError, QueryError
 
 # 合法裸标识符（用于区分字段名 vs 表达式）：仅字母数字下划线，可含点
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -97,6 +97,48 @@ class Driver(abc.ABC):
 
     def __init__(self, config: Config) -> None:
         self.config = config
+
+    # ------------------------------------------------------------------ #
+    # 能力询问（v0.11.0）
+    # ------------------------------------------------------------------ #
+    def supports_feature(self, feature: str) -> bool:
+        """是否支持某项带版本门槛的特性。
+
+        默认不支持；SQL 驱动基类放行通用能力（如 ``cte``），MySQL 驱动
+        按 :data:`tinkpyorm.drivers.mysql.MYSQL_FEATURES` 的版本矩阵回答。
+        """
+        return False
+
+    def require_feature(self, feature: str) -> None:
+        """能力不足时抛 ``UnsupportedOperation``（带明确的替代/升级提示）。"""
+        if self.supports_feature(feature):
+            return
+        raise UnsupportedOperation(
+            f"{self.name or '当前'} 驱动不支持特性: {feature}")
+
+    def json_contains_value(self, value: Any) -> Any:
+        """``where_json_contains`` 的绑定值。
+
+        SQLite 的 ``json_each`` 直接比较标量，故布尔转 0/1、其余原样；
+        MySQL 的 ``JSON_CONTAINS`` 要求候选值是**合法 JSON 文本**，由
+        驱动覆写为 ``json.dumps``。
+        """
+        if isinstance(value, bool):
+            return 1 if value else 0
+        if isinstance(value, (dict, list)):
+            raise QueryError(
+                "JSON 条件不支持 dict/list 直接比较（JSON 文本比较受键序与"
+                "格式影响，结果不可靠）：数组元素匹配请用 where_json_contains()，"
+                "对象包含请用 where_raw()")
+        return value
+
+    def upsert_values_ref(self, column: str) -> str:
+        """``ON DUPLICATE KEY UPDATE`` 中引用"待插入值"的片段。
+
+        仅有 upsert 语义的驱动实现；默认抛不支持。
+        """
+        raise UnsupportedOperation(
+            f"{self.name or '当前'} 驱动不支持 upsert")
 
     # ------------------------------------------------------------------ #
     # 连接生命周期
@@ -230,6 +272,10 @@ class Driver(abc.ABC):
     #: 其它驱动在没有实现对应方言钩子前必须保持 False，由 ``Db.collection``
     #: 快速失败并给出明确提示，而不是运行到一半抛 "no such table"。
     supports_document: bool = False
+
+    #: 是否支持 "INSERT ... ON DUPLICATE KEY UPDATE" 语义（v0.11.0）。
+    #: 仅 MySQL 置真；其它驱动调用 ``Query.upsert()`` 会在执行前被拒绝。
+    supports_upsert: bool = False
 
     #: 是否支持全文检索（:class:`~tinkpyorm.fts.FtsIndex`，依赖 FTS5 模块）。
     #:
@@ -435,6 +481,10 @@ class SQLDriver(Driver):
     """关系型数据库驱动的公共基类（SQLite 风格默认方言）。"""
 
     supports_transactions = True
+
+    def supports_feature(self, feature: str) -> bool:
+        """关系型基线能力：CTE（WITH）在 SQLite 3.8.3+ / PG / MSSQL 均可用。"""
+        return str(feature or "").strip().lower() == "cte"
 
     def ping(self) -> bool:
         try:

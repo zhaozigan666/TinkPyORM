@@ -214,12 +214,22 @@ class TestCustomDriverConfig(unittest.TestCase):
         self.assertIn("register_driver", msg)
         self.assertIn("sqlite", msg)          # 列出活注册表而非静态白名单
 
+    def test_mysql_driver_registered(self):
+        """MySQL 自 v0.11.0 起是真实驱动；缺 pymysql 时给出安装提示。"""
+        self.assertIn("mysql", available_drivers())
+        try:
+            driver_cls = get_driver("mysql")
+        except DriverNotAvailable as exc:
+            self.assertIn("pymysql", str(exc))
+        else:
+            self.assertEqual(driver_cls.name, "mysql")
+
     def test_reserved_type_passes_config_but_fails_at_connect(self):
-        """预留名（mysql 等）配置阶段放行，连接阶段才抛 DriverNotAvailable。"""
-        cfg = Config(type="mysql", database="app")
-        self.assertEqual(cfg.type, "mysql")
+        """预留名（postgresql 等）配置阶段放行，连接阶段才抛 DriverNotAvailable。"""
+        cfg = Config(type="postgresql", database="app")
+        self.assertEqual(cfg.type, "postgresql")
         with self.assertRaises(DriverNotAvailable):
-            get_driver("mysql")
+            get_driver("postgresql")
 
     def test_registry_lookup_is_live_not_cached(self):
         """注册表查询不缓存：注册动作之后校验立即通过。"""

@@ -13,13 +13,13 @@
 | JSON | `json([fields])` `where_json` `where_json_or` `where_json_null` `where_json_not_null` `where_json_exists` `where_json_not_exists` `where_json_contains` `where_json_not_contains` `where_json_length` `where_json_type` `field_json` `order_json` |
 | JSON 写入 | `update_json` `update_json_insert` `update_json_remove` `update_json_patch` |
 | 连接 | `join` `left_join` `right_join` `inner_join` |
-| 组合 | `union` `union_all` |
+| 组合 | `union` `union_all` `cte(name, query[, columns])` |
 | 分组排序 | `group` `having` `having_or` `order` `order_raw` |
 | 限制 | `limit` `page` `paginate` |
 | 查询 | `select` `select_or_fail` `find` `find_or_empty` `find_or_fail` `value` `column` `count` `sum` `avg` `max` `min` `paginate` `explain` |
 | 流式 | `chunk(size)` `cursor(chunk_size)` |
 | 缓存 | `cache(秒[, key])` |
-| 写入 | `insert` `insert_all(list, batch_size=None)` `update` `save` `delete` `inc` `dec` |
+| 写入 | `insert` `insert_all(list, batch_size=None)` `upsert(data[, update])` `update` `save` `delete` `inc` `dec` |
 | 关联 | `with_` |
 | 其他 | `comment` `lock` `fetch_sql` `fail_exception` `allow_empty` `copy` `get_last_sql` |
 
@@ -58,7 +58,7 @@
 
 ## Db（门面）
 
-`set_config` `get_connection` `close` `table` `name` `collection` `fts` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+`config` `set_config` `get_connection` `close` `table` `name` `collection` `fts` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
 
 ## 配置键（set_config 一等键）
 
@@ -70,3 +70,4 @@
 | `collection_schema_mode` | False | 文档集合写入期 schema 校验（[26](26-Collection文档集合.md)） |
 | `json` | False | 自动建表/建列模式（[27-JSON自动建表](27-JSON自动建表.md)） |
 | `cache_backend` / `cache_dir` | memory / - | 查询缓存后端：`memory` / `file`（file 须提供目录，见 [19-查询缓存](19-查询缓存.md)） |
+| `version` | 5.7.0（MySQL） | 数据库产品版本，仅 MySQL 消费（[29-MySQL支持](29-MySQL支持.md)） |

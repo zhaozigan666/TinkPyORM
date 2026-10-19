@@ -32,7 +32,7 @@ _DRIVERS: Dict[str, Type[Driver]] = {"sqlite": SQLiteDriver}
 
 #: 惰性驱动的模块路径（依赖第三方包时才导入，缺依赖时不阻断 import）
 _LAZY_DRIVERS: Dict[str, tuple] = {
-    # "mysql": ("tinkpyorm.drivers.mysql", "MySQLDriver"),
+    "mysql": ("tinkpyorm.drivers.mysql", "MySQLDriver"),
     # "postgresql": ("tinkpyorm.drivers.postgresql", "PostgresDriver"),
 }
 

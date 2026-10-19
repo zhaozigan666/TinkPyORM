@@ -118,8 +118,9 @@ from .model import Model
 from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
+from .versioning import Version, parse_version, DEFAULT_MYSQL_VERSION
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 
 __all__ = [
@@ -132,6 +133,7 @@ __all__ = [
     "normalize_json_path", "available_type_names",
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "register_driver", "get_driver", "available_drivers", "UnsupportedOperation",
+    "Version", "parse_version", "DEFAULT_MYSQL_VERSION",
     "OrmError", "QueryError", "DataNotFound", "ModelNotFound",
     "RelationNotFound", "TransactionError", "InvalidArgumentException",
     "DriverNotAvailable",
