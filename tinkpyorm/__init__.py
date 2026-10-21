@@ -92,9 +92,22 @@ JSON 自动建表/建列模式（v0.9.0）—— Db.table/Db.name 直接插入 d
     Db.set_config({"type": "oracle", "database": "x"})   # 2. 注册后立即可用
     available_type_names()                     # 当前可配置的类型名
 
+Redis 键空间（v0.13.0）—— 命名空间前缀 + 键值/哈希/列表/集合/有序集合::
+
+    Db.config({"type": "redis", "host": "127.0.0.1", "port": 6379,
+               "password": "secret", "database": 0})
+
+    cache = Db.redis("app:")                    # 前缀 app:
+    cache.set("user:1", "张三", ex=60)
+    cache.hset("user:1:profile", {"name": "张三", "age": 25})
+    cache.zadd("rank", {"张三": 98.5})
+    with cache.pipeline() as pipe:              # 单次往返批量执行
+        pipe.incr("stats:visits").set("stats:last", "now")
+        pipe.execute()
+
 ``type`` 的合法性以活驱动注册表为准（内置保留名 ∪ 已注册驱动名）；未注册的
-类型在配置阶段即报错并提示注册方式。MySQL / PostgreSQL / MongoDB / Redis
-等属"预留名"：配置阶段放行，到建立连接时才抛 ``DriverNotAvailable``。
+类型在配置阶段即报错并提示注册方式。PostgreSQL 等属"预留名"：配置阶段放行，
+到建立连接时才抛 ``DriverNotAvailable``。
 """
 from .builder import JsonWhere, JsonUpdate, JSON_OPS, JSON_UPDATE_MODES
 from .cache import CacheStore, MemoryCacheStore, FileCacheStore
@@ -115,20 +128,23 @@ from .exceptions import (
 )
 from .fts import FtsIndex, FtsQuery, fts_quote, DEFAULT_TOKENIZE
 from .mongo import MongoCollection, MONGO_OPS
+from .redis import RedisStore, RedisPipeline, RedisSubscription
 from .model import Model
 from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
 from .versioning import (
     Version, parse_version, DEFAULT_MYSQL_VERSION, DEFAULT_MONGO_VERSION,
+    DEFAULT_REDIS_VERSION, MYSQL_SUPPORTED, MONGO_SUPPORTED, REDIS_SUPPORTED,
 )
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
     "DocumentCollection", "MongoCollection", "MONGO_OPS",
+    "RedisStore", "RedisPipeline", "RedisSubscription",
     "FtsIndex", "FtsQuery", "fts_quote", "DEFAULT_TOKENIZE",
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore", "FileCacheStore",
@@ -137,6 +153,8 @@ __all__ = [
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "register_driver", "get_driver", "available_drivers", "UnsupportedOperation",
     "Version", "parse_version", "DEFAULT_MYSQL_VERSION", "DEFAULT_MONGO_VERSION",
+    "DEFAULT_REDIS_VERSION", "MYSQL_SUPPORTED", "MONGO_SUPPORTED",
+    "REDIS_SUPPORTED",
     "OrmError", "QueryError", "DataNotFound", "ModelNotFound",
     "RelationNotFound", "TransactionError", "InvalidArgumentException",
     "DriverNotAvailable", "DuplicateKeyError", "ConnectionFailedError",

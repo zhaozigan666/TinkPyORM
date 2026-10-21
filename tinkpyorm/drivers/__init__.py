@@ -34,6 +34,7 @@ _DRIVERS: Dict[str, Type[Driver]] = {"sqlite": SQLiteDriver}
 _LAZY_DRIVERS: Dict[str, tuple] = {
     "mysql": ("tinkpyorm.drivers.mysql", "MySQLDriver"),
     "mongodb": ("tinkpyorm.drivers.mongodb", "MongoDBDriver"),
+    "redis": ("tinkpyorm.drivers.redis", "RedisDriver"),
     # "postgresql": ("tinkpyorm.drivers.postgresql", "PostgresDriver"),
 }
 

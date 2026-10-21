@@ -4,6 +4,10 @@
 
 * **MySQL**：``5.7`` / ``5.7.44`` / ``8.0`` / ``8.0.36`` / ``8.4`` / ``9.1``；
   缺省 ``5.7.0``（按 5.7 处理）。
+* **MongoDB**：``4.0`` / ``4.4`` / ``6.0`` / ``7.0`` / ``8.0``；缺省 ``4.0.0``。
+* **Redis**：``5.0`` / ``6.2`` / ``7.0`` / ``7.4`` / ``8.10.2``；缺省 ``7.0.0``。
+  Redis 的小版本是**发布线**（6.2 / 7.2 / 7.4 各自独立），因此按
+  ``(major, minor)`` 精确校验，只对 8.x 放开所有小版本。
 * **SQLite**：不读取 ``version``（版本由运行时 ``sqlite3`` 决定）。
 
 解析规则（与产品无关的通用部分）：
@@ -32,6 +36,8 @@ from .exceptions import InvalidArgumentException
 
 __all__ = [
     "Version", "parse_version", "DEFAULT_MYSQL_VERSION", "MYSQL_SUPPORTED",
+    "DEFAULT_MONGO_VERSION", "MONGO_SUPPORTED",
+    "DEFAULT_REDIS_VERSION", "REDIS_SUPPORTED",
 ]
 
 #: MySQL 缺省版本（配置未给 ``version`` 时按 5.7 处理）
@@ -45,6 +51,13 @@ DEFAULT_MONGO_VERSION = "4.0.0"
 
 #: MongoDB 支持范围（v0.12.0）。4.0 是 pymongo 4.11+ 支持的服务端下限。
 MONGO_SUPPORTED = "4.0.x / 4.2.x / 4.4.x / 5.0.x / 6.0.x / 7.0.x / 8.x"
+
+#: Redis 缺省版本（配置未给 ``version`` 时按 7.0 处理）
+DEFAULT_REDIS_VERSION = "7.0.0"
+
+#: Redis 支持范围（v0.13.0）。5.0 起为官方仍在维护/广泛部署的发布线。
+REDIS_SUPPORTED = ("4.0.x / 5.0.x / 6.0.x / 6.2.x / 7.0.x / 7.2.x / "
+                   "7.4.x / 8.x")
 
 _VERSION_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+~].*)?$")
 
@@ -96,12 +109,16 @@ def parse_version(value: Any, default: Optional[str] = None,
     """把配置里的 ``version`` 归一为 :class:`Version`。
 
     ``product="generic"`` 时只解析不校验产品范围（供内部比较用）。
-    ``default=None`` 时按产品取缺省版本（MySQL 5.7 / MongoDB 4.0）。
+    ``default=None`` 时按产品取缺省版本（MySQL 5.7 / MongoDB 4.0 / Redis 7.0）。
     """
     if value is None or (isinstance(value, str) and not value.strip()):
         if default is None:
-            default = (DEFAULT_MONGO_VERSION if product == "mongodb"
-                       else DEFAULT_MYSQL_VERSION)
+            if product == "mongodb":
+                default = DEFAULT_MONGO_VERSION
+            elif product == "redis":
+                default = DEFAULT_REDIS_VERSION
+            else:
+                default = DEFAULT_MYSQL_VERSION
         value = default
 
     if isinstance(value, Version):
@@ -133,6 +150,8 @@ def parse_version(value: Any, default: Optional[str] = None,
         _validate_mysql(result)
     elif product == "mongodb":
         _validate_mongodb(result)
+    elif product == "redis":
+        _validate_redis(result)
     return result
 
 
@@ -166,3 +185,22 @@ def _validate_mongodb(version: Version) -> None:
     raise InvalidArgumentException(
         f"不支持的 MongoDB 版本: {version}。支持范围: {MONGO_SUPPORTED}；"
         f"未给 version 时默认按 {DEFAULT_MONGO_VERSION}（4.0）处理")
+
+
+def _validate_redis(version: Version) -> None:
+    """Redis 支持范围校验；越界立即报错，不做"就近猜测"。
+
+    放行真实发布线：4.0 / 5.0 / 6.0 / 6.2 / 7.0 / 7.2 / 7.4 / 8.x。
+    Redis 的小版本号是"发布线"而非补丁号（6.2 与 7.2 都是独立发布线），
+    因此这里按 ``(major, minor)`` 精确匹配，只对 8.x 放开所有小版本
+    （8.0 起改为"快速发布"节奏，8.2/8.4/8.10 均为正式版）。
+    """
+    major, minor = version.major, version.minor
+    allowed = {4: (0,), 5: (0,), 6: (0, 2), 7: (0, 2, 4)}
+    if major in allowed and minor in allowed[major]:
+        return
+    if major == 8:
+        return
+    raise InvalidArgumentException(
+        f"不支持的 Redis 版本: {version}。支持范围: {REDIS_SUPPORTED}；"
+        f"未给 version 时默认按 {DEFAULT_REDIS_VERSION}（7.0）处理")

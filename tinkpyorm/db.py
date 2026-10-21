@@ -204,6 +204,31 @@ class Db:
                                write_concern=write_concern)
 
     @classmethod
+    def redis(cls, name: str = "") -> "RedisStore":
+        """打开 Redis 键空间（v0.13.0）。
+
+        仅在 ``type="redis"`` 的连接下可用；其它驱动在构造期即抛
+        :class:`UnsupportedOperation`。
+
+        ``name`` 是**命名空间前缀**（Redis 没有表/集合，最接近的概念是
+        键前缀）：``Db.redis("app:")`` 打开的是前缀为 ``app:`` 的键空间，
+        所有键方法自动补前缀，``scan_iter`` / ``keys`` 返回逻辑键名::
+
+            Db.config({"type": "redis", "host": "127.0.0.1",
+                       "port": 6379, "password": "secret", "database": 0})
+
+            cache = Db.redis("app:")
+            cache.set("user:1", "张三", ex=60)
+            cache.hgetall("user:1:profile")
+
+        不传 ``name`` 时使用连接配置里的 ``prefix``（``Db.set_config`` 的
+        通用表前缀），便于与 SQL 侧共用同一命名空间约定。
+        """
+        from .redis import RedisStore
+        prefix = cls._prefix + str(name or "")
+        return RedisStore(cls.get_connection(), prefix=prefix)
+
+    @classmethod
     def fts(cls, name: str, columns: Any = None, *,
             tokenize: str = "trigram", prefix: Any = None,
             standalone: bool = False, content_rowid: Optional[str] = None,

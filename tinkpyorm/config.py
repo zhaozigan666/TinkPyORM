@@ -151,10 +151,12 @@ class Config:
     user: Optional[str] = None
     password: Optional[str] = None
     prefix: str = ""
-    #: 数据库产品版本（v0.11.0）。仅 MySQL 消费：``"5.7"`` / ``"8.0.36"`` /
-    #: ``"9.1"``，缺省按 5.7 处理；SQLite 忽略本字段（版本由运行时决定）。
+    #: 数据库产品版本。MySQL（v0.11.0）、MongoDB（v0.12.0）、Redis（v0.13.0）
+    #: 各自消费：``"8.0.36"`` / ``"7.0"`` / ``"7.4"``。缺省分别为 5.7.0 /
+    #: 4.0.0 / 7.0.0；SQLite 忽略本字段（版本由运行时决定）。
     #: 接受 str / int / float / (major, minor[, patch])，解析规则见
-    #: :mod:`tinkpyorm.versioning`。
+    #: :mod:`tinkpyorm.versioning`。MongoDB / Redis 还会用探测到的服务端
+    #: 版本覆盖声明值（声明高于实际时在连接期报错）。
     version: Optional[Any] = None
     #: 驱动专属参数（如 SQLite 的 timeout/journal_mode，MySQL 的 charset）
     options: Dict[str, Any] = field(default_factory=dict)

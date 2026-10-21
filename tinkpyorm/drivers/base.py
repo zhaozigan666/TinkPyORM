@@ -293,6 +293,14 @@ class Driver(abc.ABC):
     #: ``Db.mongo()`` 时在构造期即抛 :class:`UnsupportedOperation`。
     supports_mongo: bool = False
 
+    #: 是否支持 Redis 键空间访问层
+    #: （:class:`~tinkpyorm.redis.RedisStore`）。
+    #:
+    #: 与 :attr:`supports_mongo` 同构：这是**连接真实 Redis 服务端**的
+    #: 原生键值 API。仅 Redis 驱动置真；其它驱动调用 ``Db.redis()``
+    #: 时在构造期即抛 :class:`UnsupportedOperation`。
+    supports_redis: bool = False
+
     #: 是否支持 JSON 字段的路径查询。
     #:
     #: - SQLite / MySQL / PostgreSQL：True（实现下方方法即可）

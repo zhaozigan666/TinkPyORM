@@ -65,13 +65,33 @@
 
 `find` `find_or_empty` `find_or_fail` `get` `select` `select_or_fail` `create` `update` `destroy` `value` `column` `count` `sum` `avg` `max` `min` `paginate` `query` `with_trashed` `only_trashed`
 
+## RedisStore（Redis 键空间，v0.13.0）
+
+仅 `type="redis"` 的连接可用；`Db.redis("app:")` 的第一个参数是**键前缀**，
+所有键方法自动补前缀，`scan_iter` / `keys` 返回去前缀后的逻辑键名。
+详见 [31-Redis支持](31-Redis支持.md)。
+
+| 分组 | 方法 |
+|---|---|
+| 字符串 | `set(key, value, ex/px/exat/pxat/nx/xx/keepttl/get)` `setex` `psetex` `setnx` `get` `getdel` `getex` `mset` `mget` `append` `strlen` |
+| JSON | `set_json` `get_json`（整键序列化；键不存在默认抛错，`default=None` 才返回 None） |
+| 计数 | `incr` `decr` `incrbyfloat` |
+| 键 / 过期 | `exists` `delete` `unlink` `type_of` `rename` `renamenx` `touch` `expire(nx/xx/gt/lt)` `pexpire` `expireat` `persist` `ttl` `pttl` `expiretime` `randomkey` |
+| 扫描 | `scan_iter(match, count, type)` `keys` `dbsize` `clear(match)` |
+| 哈希 | `hset` `hsetnx` `hget` `hmget` `hgetall` `hdel` `hexists` `hkeys` `hvals` `hlen` `hincrby` `hincrbyfloat` `hrandfield` `hscan_iter` `hexpire` `httl` `hpersist` |
+| 列表 | `lpush` `rpush` `lpop` `rpop` `lrange` `llen` `lindex` `lset` `lrem` `ltrim` `lpos` `lmove` `lmpop` `blpop` |
+| 集合 | `sadd` `srem` `smembers` `sismember` `smismember` `scard` `spop` `srandmember` `sunion` `sinter` `sdiff` `sintercard` `sscan_iter` |
+| 有序集合 | `zadd` `zrange` `zrangebyscore` `zscore` `zmscore` `zrank` `zincrby` `zrem` `zcard` `zcount` `zpopmin` `zpopmax` `zremrangebyscore` `zscan_iter` |
+| 批量 / 订阅 | `pipeline(transaction=True)` `publish` `subscribe` |
+| 其他 | `ping` `info` `config_get` `server_version` `topology` `key` `logical` `client` `close` |
+
 ## Model（实例）
 
 `save` `delete` `force_delete` `restore` `together` `get_attr` `set_attr` `set_attrs` `get_relation` `to_dict` `to_array` `to_json` `hidden` `visible` `has_one` `has_many` `belongs_to` `belongs_to_many`
 
 ## Db（门面）
 
-`config` `set_config` `get_connection` `close` `table` `name` `collection` `fts` `mongo` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+`config` `set_config` `get_connection` `close` `table` `name` `collection` `fts` `mongo` `redis` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
 
 ## 配置键（set_config 一等键）
 
@@ -83,5 +103,5 @@
 | `collection_schema_mode` | False | 文档集合写入期 schema 校验（[26](26-Collection文档集合.md)） |
 | `json` | False | 自动建表/建列模式（[27-JSON自动建表](27-JSON自动建表.md)） |
 | `cache_backend` / `cache_dir` | memory / - | 查询缓存后端：`memory` / `file`（file 须提供目录，见 [19-查询缓存](19-查询缓存.md)） |
-| `version` | 5.7.0（MySQL） | 数据库产品版本，仅 MySQL 消费（[29-MySQL支持](29-MySQL支持.md)） |
-| `version` | 4.0.0（MongoDB） | 数据库产品版本，MySQL / MongoDB 消费（[29-MySQL支持](29-MySQL支持.md) / [30-MongoDB支持](30-MongoDB支持.md)） |
+| `version` | 5.7.0 / 4.0.0 / 7.0.0 | 数据库产品版本：MySQL / MongoDB / Redis 各自消费（[29](29-MySQL支持.md) / [30](30-MongoDB支持.md) / [31](31-Redis支持.md)） |
+| `database`（Redis） | 0 | **db 序号**（0–15），不是库名；非整数直接报错 |
