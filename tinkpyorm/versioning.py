@@ -40,6 +40,12 @@ DEFAULT_MYSQL_VERSION = "5.7.0"
 #: 支持范围的人类可读描述（错误信息与文档共用）
 MYSQL_SUPPORTED = "5.7.x / 8.0.x–8.4.x / 9.x"
 
+#: MongoDB 缺省版本（配置未给 ``version`` 时按 4.0 处理）
+DEFAULT_MONGO_VERSION = "4.0.0"
+
+#: MongoDB 支持范围（v0.12.0）。4.0 是 pymongo 4.11+ 支持的服务端下限。
+MONGO_SUPPORTED = "4.0.x / 4.2.x / 4.4.x / 5.0.x / 6.0.x / 7.0.x / 8.x"
+
 _VERSION_RE = re.compile(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+~].*)?$")
 
 
@@ -85,13 +91,17 @@ def _split(value: str) -> Tuple[int, int, int]:
     return major, minor, patch
 
 
-def parse_version(value: Any, default: str = DEFAULT_MYSQL_VERSION,
+def parse_version(value: Any, default: Optional[str] = None,
                   product: str = "mysql") -> Version:
     """把配置里的 ``version`` 归一为 :class:`Version`。
 
     ``product="generic"`` 时只解析不校验产品范围（供内部比较用）。
+    ``default=None`` 时按产品取缺省版本（MySQL 5.7 / MongoDB 4.0）。
     """
     if value is None or (isinstance(value, str) and not value.strip()):
+        if default is None:
+            default = (DEFAULT_MONGO_VERSION if product == "mongodb"
+                       else DEFAULT_MYSQL_VERSION)
         value = default
 
     if isinstance(value, Version):
@@ -121,6 +131,8 @@ def parse_version(value: Any, default: str = DEFAULT_MYSQL_VERSION,
 
     if product == "mysql":
         _validate_mysql(result)
+    elif product == "mongodb":
+        _validate_mongodb(result)
     return result
 
 
@@ -136,3 +148,21 @@ def _validate_mysql(version: Version) -> None:
     raise InvalidArgumentException(
         f"不支持的 MySQL 版本: {version}。支持范围: {MYSQL_SUPPORTED}；"
         f"未给 version 时默认按 {DEFAULT_MYSQL_VERSION}（5.7）处理")
+
+
+def _validate_mongodb(version: Version) -> None:
+    """MongoDB 支持范围校验；越界立即报错，不做"就近猜测"。
+
+    支持线为官方长期支持版本：4.0 / 4.2 / 4.4 / 5.0 / 6.0 / 7.0 / 8.0。
+    小版本号只允许偶数发布线（4.0/4.2/4.4），奇数小版本是"开发版"，
+    不保证生产可用——与 MySQL 侧"5.7 / 8.0–8.4 / 9.x"的处理一致：
+    放行真实发布线，拒绝不存在或未成型的版本。
+    """
+    major, minor = version.major, version.minor
+    if major == 4 and minor in (0, 2, 4):
+        return
+    if major in (5, 6, 7, 8):
+        return
+    raise InvalidArgumentException(
+        f"不支持的 MongoDB 版本: {version}。支持范围: {MONGO_SUPPORTED}；"
+        f"未给 version 时默认按 {DEFAULT_MONGO_VERSION}（4.0）处理")

@@ -19,7 +19,7 @@
 
 **本文件**：[简介](#简介) · [特性](#特性) · [零依赖](#零依赖) · [安装](#安装) · [快速开始](#快速开始) · [更新记录](#更新记录) · [致谢与灵感来源](#致谢与灵感来源) · [许可证](#许可证)
 
-**技术文档**：共 30 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
+**技术文档**：共 31 页 —— 在线版 [GitHub Wiki](https://github.com/zhaozigan666/TinkPyORM/wiki)，或见 [文档导航](#文档导航) / 仓库内 [`wiki/Home.md`](wiki/Home.md)
 
 ---
 
@@ -72,6 +72,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **查询缓存** —— `cache(秒)` TTL 缓存，写操作自动失效；后端可选进程内存或本地文件（落盘持久、多进程共享）
 - **全文检索（FTS5）** —— `Db.fts(name)` 建 FTS5 索引：external 模式自动挂增删改触发器，`search()` 支持布尔 / 短语 / 列过滤 / 前缀 / NEAR，`rank()` 按 bm25 加权相关度排序，`highlight()` / `snippet()` 取高亮与摘要；默认 `trigram` 分词中英文兼顾；模型可声明 `__fts__` 后用 `Model.search()` 直接拿模型实例
 - **MySQL 5.7 / 8.x / 9.x 方言** —— `Db.config(type="mysql", version="8.0.36", ...)` 指定版本（缺省按 5.7）；按版本启用/禁用 CTE、`SKIP LOCKED`、`JSON_MERGE_PATCH`、upsert 行别名等语法，无等价写法时给出"需要 >= x"的明确报错；JSON 类型词汇跨库归一、`utf8mb4` 显式指定、服务端游标流式读取
+- **MongoDB 4.0 – 8.0 数据访问层** —— `Db.mongo("users")` 打开集合：链式 `where` / `order` / `limit` / `field` + 终端 `select` / `insert` / `update` / `delete`，沿用库内既有的操作符词汇（不用 `$` 字典风格）；连接串可来自显式配置、配置中心回调或环境变量；版本能力以服务端实际探测值为准（版本 + 拓扑双门禁）；输入校验与异常归口（重复键 / 连接失败 / 无效 ObjectId 一律转成项目异常）；`ensure_index` / `explain` / `after` 游标分页等性能实践
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
 - **调试友好** —— SQL 日志、`fetch_sql`、最后一条 SQL 查询
@@ -85,7 +86,7 @@ Python 3.8–3.15 标准库：sqlite3, json, datetime, contextlib, collections, 
 ```
 
 **不需要** SQLAlchemy、不需要 Peewee、不需要任何 `pip install`（SQLite 路径）。
-MySQL 驱动是**可选依赖**：`pip install ".[mysql]"`（或 `pip install pymysql`）。
+MySQL 与 MongoDB 驱动是**可选依赖**：`pip install ".[mysql]"` / `pip install ".[mongo]"`（或直接 `pip install pymysql` / `pip install pymongo`）。
 
 **Python 版本支持**（每个版本均跑完整测试套件实测）：
 
@@ -121,6 +122,7 @@ v0.9.2 起提供 `pyproject.toml`（零依赖、MIT），也可按标准方式�
 ```bash
 pip install .                 # SQLite（零依赖）
 pip install ".[mysql]"        # 追加 MySQL 驱动（pymysql）
+pip install ".[mongo]"        # 追加 MongoDB 驱动（pymongo）
 ```
 
 ---
@@ -174,6 +176,7 @@ User.destroy(user.id)                                  # 删除
 - [26-Collection文档集合](wiki/26-Collection文档集合.md) —— schemaless 文档存储：CRUD、路径条件、字段提升与索引、schema 校验
 - [27-JSON自动建表](wiki/27-JSON自动建表.md) —— `json: True` 模式：Db.table/Db.name 自动建表、缺失字段自动加列、类型推断
 - [29-MySQL支持](wiki/29-MySQL支持.md) —— MySQL 5.7 / 8.x / 9.x：版本配置、差异矩阵、版本门禁与降级输出
+- [30-MongoDB支持](wiki/30-MongoDB支持.md) —— MongoDB 4.0 – 8.0：连接配置、集合增删改查、输入校验、异常归口、索引与分页性能实践
 
 **查询**
 
@@ -224,6 +227,20 @@ User.destroy(user.id)                                  # 删除
 ---
 
 ## 更新记录
+
+### v0.12.0
+
+MongoDB 数据访问层。
+
+- 新增 `tinkpyorm/drivers/mongodb.py`：pymongo 连接、连接串拼装、配置来源优先级（**显式配置 > 配置中心回调 > 环境变量 > 默认值**）、超时与重连选项、写关注（`w` / `j` / `wtimeout`）、`hello` 握手探测服务端版本
+- 新增 `tinkpyorm/mongo.py`（`MongoCollection`）：集合级增删改查 —— `insert` / `insert_many` / `insert_many_ordered` / `bulk_write` / `select` / `find_by_id` / `count` / `distinct` / `aggregate` / `update` / `update_many` / `update_raw` / `replace` / `delete` / `delete_many`
+- 沿用库内既有的操作符词汇（`where` 用 `>=` / `in` / `between` / `like` / `exists` / `contains` 等，**不用 MongoDB 的 `$` 字典风格**），并提供 `where_raw` / `update_raw` / `aggregate` 三个原生语法逃生舱
+- 输入校验：集合名 / 字段名 / 文档结构 / 必填项 / 字段类型 / 运算符 / 分页参数 / 排序方向 / 索引字段描述，违规即抛 `InvalidArgumentException` 或 `QueryError`
+- 异常归口：`pymongo` / `bson` 异常统一翻译为项目异常（重复键 → `DuplicateKeyError`、连接失败与认证失败 → `ConnectionFailedError`、无效 ObjectId → `InvalidArgumentException`、其余 → `QueryError`），调用方无需 import 第三方库
+- 版本能力：以**实际探测**的服务端版本为准（MongoDB 可廉价探测），显式 `version` 退化为断言（声明高于实际服务端即报错）；新增 `MONGO_FEATURES` / `MONGO_REMOVED` 能力矩阵
+- 性能实践：`ensure_index` 复合索引、`explain()` 自查是否命中索引、字段投影、默认 `limit` 上限、`insert_many` 批量写、`$lookup` / `where_in` 避免 N+1、偏移量与游标（keyset）两种分页方案
+- 新增 `test_mongo.py`（118 项，离线）+ `test_mongo_live.py`（32 项真实服务端集成测试，凭据经环境变量传入，未设置则整份跳过）；合计 **676 项单元测试 + 174 项示例**通过
+- 新增 `wiki/30-MongoDB支持.md`
 
 ### v0.11.0
 

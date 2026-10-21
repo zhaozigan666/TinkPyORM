@@ -182,6 +182,28 @@ class Db:
         return Query(cls.get_connection(), prefix=cls._prefix).name(table)
 
     @classmethod
+    def mongo(cls, name: str, *,
+              write_concern: Optional[Dict[str, Any]] = None) -> "MongoCollection":
+        """打开 MongoDB 集合（v0.12.0）。
+
+        仅在 ``type="mongodb"`` 的连接下可用；其它驱动在构造期即抛
+        :class:`UnsupportedOperation`（与 :meth:`collection` 的行为一致）::
+
+            Db.config({"type": "mongodb", "database": "app",
+                       "options": {"uri": "mongodb://127.0.0.1:27017"}})
+
+            users = Db.mongo("users")
+            users.insert({"name": "张三", "age": 25})
+            users.where("age", ">=", 18).order("age", "desc").limit(10).select()
+
+        ``write_concern`` 可按集合覆盖写关注（如 ``{"w": "majority"}``）。
+        详见 :class:`~tinkpyorm.mongo.MongoCollection`。
+        """
+        from .mongo import MongoCollection
+        return MongoCollection(cls.get_connection(), name, prefix=cls._prefix,
+                               write_concern=write_concern)
+
+    @classmethod
     def fts(cls, name: str, columns: Any = None, *,
             tokenize: str = "trigram", prefix: Any = None,
             standalone: bool = False, content_rowid: Optional[str] = None,

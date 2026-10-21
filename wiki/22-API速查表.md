@@ -35,6 +35,19 @@
 | 工具 | `fts_quote(text)` |
 | 模型 | `Model.fts_index()` `Model.search(query)`（需声明 `__fts__`） |
 
+## MongoCollection（MongoDB 集合，v0.12.0）
+
+仅 `type="mongodb"` 的连接可用；详见 [30-MongoDB支持](30-MongoDB支持.md)。
+
+| 分组 | 方法 |
+|---|---|
+| 条件 | `where(field, op, value)` `where_or(...)` `where_raw(filter)` `where_in(field, values)` `where_null(field)` `where_exists(field)` |
+| 排序 / 投影 / 分页 | `order(field, direction)` `field(*names)` `exclude(*names)` `limit(length, offset)` `page(page, list_rows)` `after(last_id)` |
+| 读取 | `select()` `find(pk)` `find_by_id(oid)` `count()` `distinct(field)` `aggregate(pipeline)` `explain()` |
+| 写入 | `insert(doc)` `insert_many(docs)` `insert_many_ordered(docs)` `update(changes, upsert)` `update_many(changes, upsert)` `update_raw(update_doc, many, upsert)` `replace(doc, upsert)` `delete(pk)` `delete_many()` `bulk_write(requests)` |
+| 索引 | `ensure_index(fields, unique, name)` `drop_index(name)` `indexes()` |
+| 校验 | `schema(mapping, required)` |
+
 ## DocumentCollection（文档集合，v0.8.0）
 
 入口：`Db.collection(name)`。详见 [26-Collection文档集合](26-Collection文档集合.md)。
@@ -58,7 +71,7 @@
 
 ## Db（门面）
 
-`config` `set_config` `get_connection` `close` `table` `name` `collection` `fts` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
+`config` `set_config` `get_connection` `close` `table` `name` `collection` `fts` `mongo` `raw` `query` `execute` `transaction` `clear_cache` `cache_store` `get_sql_log` `get_last_sql` `sql_log_clear` `sql_log_disable` `sql_log_enable`
 
 ## 配置键（set_config 一等键）
 
@@ -71,3 +84,4 @@
 | `json` | False | 自动建表/建列模式（[27-JSON自动建表](27-JSON自动建表.md)） |
 | `cache_backend` / `cache_dir` | memory / - | 查询缓存后端：`memory` / `file`（file 须提供目录，见 [19-查询缓存](19-查询缓存.md)） |
 | `version` | 5.7.0（MySQL） | 数据库产品版本，仅 MySQL 消费（[29-MySQL支持](29-MySQL支持.md)） |
+| `version` | 4.0.0（MongoDB） | 数据库产品版本，MySQL / MongoDB 消费（[29-MySQL支持](29-MySQL支持.md) / [30-MongoDB支持](30-MongoDB支持.md)） |

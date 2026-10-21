@@ -114,18 +114,21 @@ from .exceptions import (
     DriverNotAvailable,
 )
 from .fts import FtsIndex, FtsQuery, fts_quote, DEFAULT_TOKENIZE
+from .mongo import MongoCollection, MONGO_OPS
 from .model import Model
 from .query import Query
 from .relation import Relation
 from .utils import Raw, raw, to_snake, to_camel
-from .versioning import Version, parse_version, DEFAULT_MYSQL_VERSION
+from .versioning import (
+    Version, parse_version, DEFAULT_MYSQL_VERSION, DEFAULT_MONGO_VERSION,
+)
 
-__version__ = "0.11.0"
+__version__ = "0.12.0"
 
 
 __all__ = [
     "Db", "Model", "Query", "Connection", "Collection", "Paginator", "Relation",
-    "DocumentCollection",
+    "DocumentCollection", "MongoCollection", "MONGO_OPS",
     "FtsIndex", "FtsQuery", "fts_quote", "DEFAULT_TOKENIZE",
     "Raw", "raw", "to_snake", "to_camel",
     "CacheStore", "MemoryCacheStore", "FileCacheStore",
@@ -133,8 +136,8 @@ __all__ = [
     "normalize_json_path", "available_type_names",
     "Driver", "SQLDriver", "NoSQLDriver", "SQLiteDriver",
     "register_driver", "get_driver", "available_drivers", "UnsupportedOperation",
-    "Version", "parse_version", "DEFAULT_MYSQL_VERSION",
+    "Version", "parse_version", "DEFAULT_MYSQL_VERSION", "DEFAULT_MONGO_VERSION",
     "OrmError", "QueryError", "DataNotFound", "ModelNotFound",
     "RelationNotFound", "TransactionError", "InvalidArgumentException",
-    "DriverNotAvailable",
+    "DriverNotAvailable", "DuplicateKeyError", "ConnectionFailedError",
 ]

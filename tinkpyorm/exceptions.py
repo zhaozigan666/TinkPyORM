@@ -31,3 +31,16 @@ class InvalidArgumentException(OrmError):
 
 class DriverNotAvailable(OrmError):
     """驱动未安装或未提供实现（如未安装 pymysql 时使用 mysql 驱动）。"""
+
+
+class DuplicateKeyError(OrmError):
+    """唯一键 / 唯一索引冲突（如 MongoDB 的重复 _id）。"""
+
+
+class ConnectionFailedError(OrmError):
+    """数据库连接失败、超时或服务端不可用。
+
+    v0.12.0 引入：MongoDB 驱动把 ``pymongo`` 的连接类异常
+    （连接失败 / 服务选择超时 / 网络超时）统一转换为本异常，
+    使调用方无需 import 第三方库即可捕获。
+    """

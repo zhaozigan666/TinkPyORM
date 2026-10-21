@@ -16,6 +16,7 @@
 | [26-Collection文档集合](26-Collection文档集合.md) | schemaless 文档存储：CRUD、路径条件、字段提升与索引、schema 校验 |
 | [27-JSON自动建表](27-JSON自动建表.md) | `json: True` 模式：Db.table/Db.name 自动建表、缺失字段自动加列、类型推断 |
 | [29-MySQL支持](29-MySQL支持.md) | MySQL 5.7/8.x/9.x：版本配置、差异矩阵、门禁与降级行为 |
+| [30-MongoDB支持](30-MongoDB支持.md) | MongoDB 4.0–8.0：连接配置、集合增删改查、输入校验、异常归口、索引与分页性能实践 |
 
 ## 查询
 

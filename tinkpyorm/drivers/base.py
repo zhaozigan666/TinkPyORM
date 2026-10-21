@@ -284,6 +284,15 @@ class Driver(abc.ABC):
     #: :class:`UnsupportedOperation`。
     supports_fts: bool = False
 
+    #: 是否支持"文档集合"式的 MongoDB 访问层
+    #: （:class:`~tinkpyorm.mongo.MongoCollection`）。
+    #:
+    #: 与 :attr:`supports_document` 不同——后者是**建在 SQLite 上的**文档
+    #: 存储（单表两列 + JSON 列），本标志是**连接真实 MongoDB 服务端**
+    #: 的原生集合 API。仅 MongoDB 驱动置真；其它驱动调用
+    #: ``Db.mongo()`` 时在构造期即抛 :class:`UnsupportedOperation`。
+    supports_mongo: bool = False
+
     #: 是否支持 JSON 字段的路径查询。
     #:
     #: - SQLite / MySQL / PostgreSQL：True（实现下方方法即可）
