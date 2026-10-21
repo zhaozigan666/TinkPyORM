@@ -246,6 +246,15 @@ class RedisStore:
         """部署形态：``standalone`` / ``cluster`` / ``sentinel``。"""
         return getattr(self.driver, "topology", None)
 
+    def db(self) -> int:
+        """当前连接的 db 序号（0 起）。
+
+        Redis 默认配置 16 个 db（0–15），由 `Db.config(database=...)` 指定。
+        同一个 db 内所有键共享地址空间，**db 之间互不可见**——用不同 db
+        隔离环境（如 0=生产、1=测试）时务必确认这里取到的是预期值。
+        """
+        return int(getattr(self.driver, "db", 0))
+
     # ------------------------------------------------------------------ #
     # 字符串
     # ------------------------------------------------------------------ #

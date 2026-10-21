@@ -204,6 +204,8 @@ class _FakeRedis:
     role = "master"
     info_raises = False
     backend_failure = None
+    #: 握手（PING）时抛出的异常，用于模拟 SELECT 失败
+    ping_error = None
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -247,6 +249,8 @@ class _FakeRedis:
 
     def ping(self):
         self.calls.append(("ping", (), {}))
+        if _FakeRedis.ping_error is not None:
+            raise _FakeRedis.ping_error
         return True
 
     def close(self):
@@ -264,7 +268,8 @@ class _FakeRedis:
 
 def _install_fake_redis(server_version="8.0.0", topology="standalone",
                         role="master", info_raises=False,
-                        responses=None, backend_failure=None):
+                        responses=None, backend_failure=None,
+                        ping_error=None, databases=None):
     """把假 ``redis`` 模块装进 sys.modules（测试结束由 tearDown 还原）。"""
     _FakeRedis.server_version = server_version
     _FakeRedis.topology = topology
@@ -272,6 +277,11 @@ def _install_fake_redis(server_version="8.0.0", topology="standalone",
     _FakeRedis.info_raises = info_raises
     _FakeRedis.responses = dict(responses or {})
     _FakeRedis.backend_failure = backend_failure
+    _FakeRedis.ping_error = ping_error
+    if databases is not None:
+        # INFO 不含 databases（真实服务端如此），只能由 CONFIG GET 提供
+        _FakeRedis.responses = dict(_FakeRedis.responses or {})
+        _FakeRedis.responses["config_get"] = {"databases": str(databases)}
 
     module = types.ModuleType("redis")
     module.Redis = _FakeRedis
@@ -1107,6 +1117,198 @@ class TestDriverBoundary(unittest.TestCase):
         Db.config({"type": "redis", "host": "h", "password": "p"})
         self.assertIsInstance(Db.redis(), RedisStore)
         self.assertIsInstance(Db.redis().pipeline(), RedisPipeline)
+
+
+# ---------------------------------------------------------------------- #
+# 选择 db（Redis 默认 16 个 db）
+# ---------------------------------------------------------------------- #
+class TestRedisDbSelection(unittest.TestCase):
+    """``database`` / ``db`` 两种写法、冲突检测、越界与集群门禁。"""
+
+    def setUp(self):
+        _clear_env()
+        _install_fake_redis()
+        _reset_db()
+
+    def tearDown(self):
+        _reset_db()
+        _restore_redis()
+        _clear_env()
+
+    def _settings(self, config):
+        _reset_db()
+        conn = Db.config(config)
+        return conn.driver._resolve_settings()
+
+    def test_database_field(self):
+        settings = self._settings({"type": "redis", "host": "h",
+                                   "password": "p", "database": 3})
+        self.assertEqual(settings["database"], 3)
+
+    def test_database_accepts_numeric_string(self):
+        settings = self._settings({"type": "redis", "host": "h",
+                                   "password": "p", "database": "7"})
+        self.assertEqual(settings["database"], 7)
+
+    def test_db_alias_in_options(self):
+        """``options={'db': n}`` 与 ``database=n`` 等价（redis-py 的写法）。"""
+        settings = self._settings({"type": "redis", "host": "h",
+                                   "password": "p",
+                                   "options": {"db": 4}})
+        self.assertEqual(settings["database"], 4)
+
+    def test_db_alias_accepts_string(self):
+        settings = self._settings({"type": "redis", "host": "h",
+                                   "password": "p",
+                                   "options": {"db": "6"}})
+        self.assertEqual(settings["database"], 6)
+
+    def test_db_from_config_resolver(self):
+        settings = self._settings({"type": "redis", "host": "h",
+                                   "password": "p",
+                                   "options": {"config_resolver":
+                                               lambda: {"db": 9}}})
+        self.assertEqual(settings["database"], 9)
+
+    def test_db_from_env(self):
+        os.environ["REDIS_DB"] = "11"
+        settings = self._settings({"type": "redis", "host": "h",
+                                   "password": "p"})
+        self.assertEqual(settings["database"], 11)
+
+    def test_url_db_is_parsed(self):
+        """连接串路径里的 /N 就是生效 db（redis-py 连接时按它 SELECT）。"""
+        settings = self._settings({"type": "redis",
+                                   "options": {"url": "redis://:p@h:6379/12"}})
+        self.assertEqual(settings["url"], "redis://:p@h:6379/12")
+        self.assertEqual(settings["database"], 12)
+
+    def test_url_without_db(self):
+        settings = self._settings({"type": "redis",
+                                   "options": {"url": "redis://:p@h:6379"}})
+        self.assertEqual(settings["database"], 0)
+
+    def test_url_db_conflicts_with_field(self):
+        """URL 的 /4 与 database=5 不一致 -> 报错（不静默取一个）。"""
+        _reset_db()
+        conn = Db.config({"type": "redis", "database": 5,
+                          "options": {"url": "redis://:p@h:6379/4"}})
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver._resolve_settings()
+        self.assertIn("不一致", str(ctx.exception))
+
+    def test_conflicting_db_values_rejected(self):
+        """``database`` 与 ``db`` 同时给出且不一致 -> 报错（不静默取一个）。"""
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 3, "options": {"db": 5}})
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver.connect()
+        message = str(ctx.exception)
+        self.assertIn("不一致", message)
+        self.assertIn("database", message)
+
+    def test_consistent_db_values_allowed(self):
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 3, "options": {"db": "3"}})
+        conn.driver.connect()
+        self.assertEqual(conn.driver.db, 3)
+
+    def test_driver_db_property_without_connect(self):
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 5})
+        self.assertEqual(conn.driver.db, 5)   # 未连接也能解析
+
+    def test_store_db(self):
+        _reset_db()
+        Db.config({"type": "redis", "host": "h", "password": "p",
+                   "database": 2})
+        self.assertEqual(Db.redis("app:").db(), 2)
+
+    def test_dialect_info_reports_db(self):
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 2})
+        info = conn.driver.dialect_info()
+        self.assertEqual(info["db"], 2)
+        self.assertIn("server_databases", info)
+
+    def test_server_databases_detected_via_config_get(self):
+        """``INFO`` 不含 databases，必须用 ``CONFIG GET`` 探测。"""
+        _install_fake_redis(databases=16)
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p"})
+        conn.driver.connect()
+        self.assertEqual(conn.driver.server_databases, 16)
+
+    def test_db_beyond_server_range_rejected(self):
+        """服务端只配了 4 个 db 时，db=4 必须被拦下并说清范围。"""
+        _install_fake_redis(databases=4)
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 4})
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver.connect()
+        message = str(ctx.exception)
+        self.assertIn("越界", message)
+        self.assertIn("4 个 db", message)
+        self.assertFalse(conn.driver.is_connected())
+
+    def test_last_valid_db_accepted(self):
+        _install_fake_redis(databases=4)
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 3})
+        conn.driver.connect()
+        self.assertEqual(conn.driver.db, 3)
+
+    def test_select_failure_explained_as_config_error(self):
+        """握手阶段 SELECT 越界（ResponseError）要解释成配置错误。"""
+        exc = type("ResponseError", (Exception,), {"__name__": "ResponseError"})
+        _install_fake_redis(ping_error=exc("DB index is out of range"))
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 99})
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver.connect()
+        message = str(ctx.exception)
+        self.assertIn("越界", message)
+        self.assertIn("99", message)
+        self.assertFalse(conn.driver.is_connected())
+
+    def test_cluster_rejects_non_zero_db(self):
+        """集群只有 db 0：配置非 0 必须在连接期拒绝。"""
+        _install_fake_redis(topology="cluster", databases=16)
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 2})
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver.connect()
+        message = str(ctx.exception)
+        self.assertIn("集群", message)
+        self.assertIn("db 0", message)
+
+    def test_cluster_allows_db_zero(self):
+        _install_fake_redis(topology="cluster", databases=16)
+        _reset_db()
+        conn = Db.config({"type": "redis", "host": "h", "password": "p",
+                          "database": 0})
+        conn.driver.connect()
+        self.assertEqual(conn.driver.db, 0)
+        self.assertEqual(conn.driver.topology, "cluster")
+
+    def test_negative_db_rejected(self):
+        with self.assertRaises(InvalidArgumentException):
+            self._settings({"type": "redis", "host": "h", "password": "p",
+                            "database": -1})
+
+    def test_non_numeric_db_rejected(self):
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            self._settings({"type": "redis", "host": "h", "password": "p",
+                            "database": "app"})
+        self.assertIn("db 序号", str(ctx.exception))
 
 
 if __name__ == "__main__":

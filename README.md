@@ -73,7 +73,7 @@ Db.name('user').where('status', 1).where('age', '>', 18).order('id', 'desc').sel
 - **全文检索（FTS5）** —— `Db.fts(name)` 建 FTS5 索引：external 模式自动挂增删改触发器，`search()` 支持布尔 / 短语 / 列过滤 / 前缀 / NEAR，`rank()` 按 bm25 加权相关度排序，`highlight()` / `snippet()` 取高亮与摘要；默认 `trigram` 分词中英文兼顾；模型可声明 `__fts__` 后用 `Model.search()` 直接拿模型实例
 - **MySQL 5.7 / 8.x / 9.x 方言** —— `Db.config(type="mysql", version="8.0.36", ...)` 指定版本（缺省按 5.7）；按版本启用/禁用 CTE、`SKIP LOCKED`、`JSON_MERGE_PATCH`、upsert 行别名等语法，无等价写法时给出"需要 >= x"的明确报错；JSON 类型词汇跨库归一、`utf8mb4` 显式指定、服务端游标流式读取
 - **MongoDB 4.0 – 8.0 数据访问层** —— `Db.mongo("users")` 打开集合：链式 `where` / `order` / `limit` / `field` + 终端 `select` / `insert` / `update` / `delete`，沿用库内既有的操作符词汇（不用 `$` 字典风格）；连接串可来自显式配置、配置中心回调或环境变量；版本能力以服务端实际探测值为准（版本 + 拓扑双门禁）；输入校验与异常归口（重复键 / 连接失败 / 无效 ObjectId 一律转成项目异常）；`ensure_index` / `explain` / `after` 游标分页等性能实践
-- **Redis 4.0 – 8.x 键空间** —— `Db.redis("app:")` 打开命名空间：字符串 / 哈希 / 列表 / 集合 / 有序集合全类型 CRUD，键前缀自动补全、`scan_iter` 增量遍历、`pipeline()` 单往返批量执行、`subscribe()` 发布订阅；`version` 以 `INFO server` 探测值为准并按发布线门禁（6.2 / 7.0 / 7.4 / 8.0 的命令差异），集群形态另做拓扑门禁；`redis.exceptions.*` 全部归口为项目异常；`keys()` 与 `clear()` 有防误删护栏
+- **Redis 4.0 – 8.x 键空间** —— `Db.redis("app:")` 打开命名空间：字符串 / 哈希 / 列表 / 集合 / 有序集合全类型 CRUD，键前缀自动补全、`scan_iter` 增量遍历、`pipeline()` 单往返批量执行、`subscribe()` 发布订阅；**可指定 db 序号**（默认 16 个，配置冲突与越界都会明确报错）；`version` 以 `INFO server` 探测值为准并按发布线门禁（6.2 / 7.0 / 7.4 / 8.0 的命令差异），集群形态另做拓扑门禁；`redis.exceptions.*` 全部归口为项目异常；`keys()` 与 `clear()` 有防误删护栏
 - **流式读取** —— `chunk()` 分块 / `cursor()` 逐行，大表不爆内存
 - **线程安全** —— 连接级可重入锁，多线程共享连接时事务语义正确
 - **调试友好** —— SQL 日志、`fetch_sql`、最后一条 SQL 查询
@@ -231,6 +231,17 @@ User.destroy(user.id)                                  # 删除
 
 ## 更新记录
 
+### v0.13.1
+
+Redis 支持手动指定 db 序号（默认 16 个 db：0–15）。
+
+- `database` 是 **db 序号**，四种写法等价：`database=3` / `options={"db": 3}` / URL 里的 `/3` / 环境变量 `REDIS_DB`
+- **配置来源冲突即报错**：`database` 与 `db`（或 URL 的 `/N`）不一致时列出全部来源，不静默取一个——否则改了配置却不生效，排查成本极高
+- **越界校验**：连接后由 `CONFIG GET databases` 取服务端真实 db 数，配置序号越界即断开并报出"服务端只配置了 N 个 db（0–N-1）"；握手阶段被服务端拒绝（`DB index is out of range`）也翻译成配置错误而不是泛化的 `QueryError`
+- **集群门禁**：集群模式只有 db 0，配置非 0 在连接期即拒绝
+- 新增 `driver.db` / `driver.server_databases` / `RedisStore.db()` / `dialect_info()["db"]`，便于确认当前落在哪个 db
+- 新增 22 项离线测试（共 136 项）+ 7 项真实服务端测试（共 66 项）；合计 **812 项单元测试 + 174 项示例**
+
 ### v0.13.0
 
 Redis 数据访问层。
@@ -242,7 +253,7 @@ Redis 数据访问层。
 - 输入校验：键名/成员名类型、标量值约束（容器明确拒绝并提示 `set_json`）、`nx`/`xx` 互斥、`ex`/`px` 互斥、db 序号必须是整数、流水线未登记命令直接拒绝
 - 异常归口：`redis.exceptions.*` 统一翻译（连接/超时/认证 → `ConnectionFailedError`，`DataError` → `InvalidArgumentException`，服务端拒绝 → `QueryError`），**含 `connect()` 里的 PING 与流水线 `execute()`** 两个易漏位置
 - 安全护栏：`keys()` 在 db 键数 > 10000 时拒绝执行；`clear()` 拒绝整库模式；未知连接选项不透传
-- 新增 `test_redis.py`（114 项离线）+ `test_redis_live.py`（59 项真实服务端集成，凭据仅经 `TINKPYORM_REDIS_TEST_URL` 传入，未设置则整份跳过），在 Redis 8.10.2 上实测通过；合计 **790 项单元测试 + 174 项示例**
+- 新增 `test_redis.py`（136 项离线）+ `test_redis_live.py`（66 项真实服务端集成，凭据仅经 `TINKPYORM_REDIS_TEST_URL` 传入，未设置则整份跳过），在 Redis 8.10.2 上实测通过；合计 **812 项单元测试 + 174 项示例**
 - 新增 `wiki/31-Redis支持.md` 与 `docs/redis.md`
 
 ### v0.12.0

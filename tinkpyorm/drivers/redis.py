@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Dict, Optional, Sequence
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 from ..exceptions import (
     ConnectionFailedError,
@@ -260,6 +260,10 @@ class RedisDriver(NoSQLDriver):
         self._detected_version: Optional[Version] = None
         #: 部署形态：``standalone`` / ``cluster`` / ``sentinel`` / None（未知）
         self._topology: Optional[str] = None
+        #: 当前生效的 db 序号（连接时确定；未连接时为 None）
+        self._db: Optional[int] = None
+        #: 服务端配置的 db 总数（``INFO`` 的 ``databases``，默认 16）
+        self._server_databases: Optional[int] = None
         #: 是否只读副本（``INFO replication`` 的 ``role:slave``）
         self._replica: Optional[bool] = None
         self._client: Any = None
@@ -308,6 +312,25 @@ class RedisDriver(NoSQLDriver):
         ``SELECT`` 不可用；多键命令要求同 slot。
         """
         return self._topology
+
+    @property
+    def db(self) -> int:
+        """当前生效的 db 序号（0 起）。
+
+        未连接时按配置解析（不建立连接）；配置非法时返回 0 而不是抛错——
+        本属性用于日志/展示，严格校验发生在 :meth:`connect`。
+        """
+        if self._db is not None:
+            return self._db
+        try:
+            return int(self._resolve_settings()["database"])
+        except Exception:
+            return 0
+
+    @property
+    def server_databases(self) -> Optional[int]:
+        """服务端配置的 db 总数（``INFO`` 的 ``databases``，未探测时为 None）。"""
+        return self._server_databases
 
     @property
     def is_replica(self) -> Optional[bool]:
@@ -383,6 +406,8 @@ class RedisDriver(NoSQLDriver):
                                  if self._detected_version else None),
             "topology": self._topology,
             "is_replica": self._replica,
+            "db": self.db,
+            "server_databases": self._server_databases,
             "supported_range": REDIS_SUPPORTED,
             "features": self.features(),
         }
@@ -456,9 +481,44 @@ class RedisDriver(NoSQLDriver):
                 f"Redis 的 database 是 db 序号（0–15），必须是整数，收到: "
                 f"{raw_db!r}；如果要连的是 URL，请放在 options['url'] 里")
 
+        # ``db`` 是 ``database`` 的别名（redis-py 的连接参数就叫 db）。
+        # 四个来源（config 字段 / options.database / options.db / URL 的 /N）
+        # 指向同一个值，互相不一致时**报错**而不是静默取一个——否则用户改了
+        # 配置却不生效，排查成本极高。
+        option_db = explicit_options.get("db")
+        if option_db is None:
+            option_db = resolver.get("db")
+        if option_db is None:
+            option_db = resolver_options.get("db")
+        explicit_db = explicit_options.get("database")
+        if explicit_db is None:
+            explicit_db = resolver.get("database")
+
         url = explicit_options.get("url") or resolver_options.get("url")
         if url is None:
             url = pick("url")
+        url_db = _db_from_url(url)
+
+        candidates = [("config.database", raw_db),
+                      ("options.database", explicit_db),
+                      ("options.db", option_db)]
+        if url_db is not None:
+            candidates.append(("url", url_db))
+        given = [(name, value) for name, value in candidates
+                 if value not in (None, "", ":memory:")]
+        if len({str(value).strip() for _, value in given}) > 1:
+            detail = "、".join(f"{name}={value!r}" for name, value in given)
+            raise InvalidArgumentException(
+                f"Redis 的 db 序号给了多个不一致的值：{detail}；"
+                f"请只保留一个（database / db / URL 里的 /N 是同一个配置项）")
+
+        if url_db is not None:
+            # URL 里的 /N 是最终生效值（redis-py 连接时就按它 SELECT）
+            db_value: Any = url_db
+        elif given:
+            db_value = given[0][1]
+        else:
+            db_value = pick("database", 0)
 
         settings: Dict[str, Any] = {
             "url": url,
@@ -466,7 +526,7 @@ class RedisDriver(NoSQLDriver):
             "port": pick("port", 6379),
             "user": pick("user"),
             "password": pick("password"),
-            "database": pick("database", 0),
+            "database": db_value,
             "options": {},
         }
 
@@ -561,6 +621,7 @@ class RedisDriver(NoSQLDriver):
                 "（或 pip install tinkpyorm[redis]）") from exc
 
         settings = self._resolve_settings()
+        self._db = int(settings["database"])
         url = self._build_url(settings)
         kwargs = dict(settings["options"])
         # 连接串里已包含 host/port/db/凭据（密码经 quote 转义），
@@ -583,8 +644,12 @@ class RedisDriver(NoSQLDriver):
             except OrmError:
                 raise
             except Exception as exc:
-                raise translate_redis_error(exc) from exc
+                # SELECT 失败（db 越界 / 集群禁用 SELECT）要在建连阶段
+                # 解释成"db 配错了"，而不是丢一个泛化的服务端错误。
+                explained = self._select_error(exc)
+                raise (explained or translate_redis_error(exc)) from exc
             self._detect_meta()
+            self._check_db_index()
         except BaseException:
             # 握手失败：回滚，避免留下"看似已连接、实则不可用"的客户端
             self.close()
@@ -617,11 +682,19 @@ class RedisDriver(NoSQLDriver):
                     except Exception:
                         self._detected_version = None
             self._topology = self._classify_topology(info)
+            databases = info.get("databases")
+            if databases is not None:
+                try:
+                    self._server_databases = int(databases)
+                except (TypeError, ValueError):
+                    self._server_databases = None
             role = info.get("role")
             if role:
                 self._replica = str(role).lower() in ("slave", "replica")
         else:
             self._topology = self._topology or "standalone"
+        # INFO 不含 databases（实测 8.10.2），统一走 CONFIG GET 探测
+        self._detect_databases()
         if self._detected_version is None:
             # 无 INFO 权限：以声明值为准（若也没有则用默认）
             self._detected_version = self._declared_version
@@ -637,6 +710,71 @@ class RedisDriver(NoSQLDriver):
         if info.get("redis_mode") == "sentinel":
             return "sentinel"
         return "standalone"
+
+    def _detect_databases(self) -> None:
+        """探测服务端配置的 db 总数（``CONFIG GET databases``，默认 16）。
+
+        ``INFO`` **不包含** ``databases`` 字段（实测 Redis 8.10.2），只能用
+        ``CONFIG GET``；ACL 未授权 ``+config|get`` 时静默跳过——拿不到就
+        不做"上限校验"，留给服务端在握手阶段自己拒绝。
+        """
+        if self._server_databases is not None:
+            return
+        try:
+            raw = self._client.config_get("databases")
+        except Exception:
+            return
+        if not isinstance(raw, dict):
+            return
+        value = raw.get("databases", raw.get(b"databases"))
+        try:
+            self._server_databases = int(value)
+        except (TypeError, ValueError):
+            self._server_databases = None
+
+    def _check_db_index(self) -> None:
+        """连接后校验 db 序号是否落在服务端配置的范围内。
+
+        顺序在 :meth:`_detect_meta` 之后：``INFO`` 的 ``databases`` 是服务端
+        **真实配置**（默认 16，可用 ``databases`` 指令改成别的值），只有连上
+        才知道。越界即断开连接并报出"服务端只有 N 个 db"。
+        """
+        if self._db is None:
+            return
+        db = self._db          # close() 会复位 _db，先留存用于报错信息
+        if self._topology == "cluster" and db != 0:
+            self.close()
+            raise InvalidArgumentException(
+                f"Redis 集群模式只有 db 0，不支持 db {db}；"
+                f"请把 database 改成 0（或改用非集群实例）")
+        if self._server_databases is not None and db >= self._server_databases:
+            total = self._server_databases
+            self.close()
+            raise InvalidArgumentException(
+                f"Redis db 序号越界：配置的是 {db}，"
+                f"而服务端只配置了 {total} 个 db（0–{total - 1}）；"
+                f"请修正 database（服务端可用 databases 指令扩容）")
+
+    def _select_error(self, exc: BaseException) -> Optional[BaseException]:
+        """把"建连时 SELECT 失败"解释成可操作的配置错误。
+
+        服务端在握手阶段执行 ``SELECT <db>``，所以 db 写错的表现是
+        ``ResponseError: DB index is out of range``——直接归到 ``QueryError``
+        会让人以为是命令写错了，这里明确指向配置项。
+        """
+        text = str(exc).lower()
+        if "db index is out of range" in text or ("out of range" in text and "db" in text):
+            db = self._db
+            total = self._server_databases
+            hint = f"（服务端配置了 {total} 个 db，0–{total - 1}）" if total else \
+                "（默认共 16 个 db：0–15，服务端实际值见 CONFIG GET databases）"
+            return InvalidArgumentException(
+                f"Redis db 序号越界：配置的是 {db}{hint}；请修正 database")
+        if "select" in text and ("cluster" in text or "not allowed" in text):
+            return InvalidArgumentException(
+                f"当前部署形态不支持选择 db（配置的是 {self._db}）："
+                f"Redis 集群只有 db 0；请把 database 改成 0")
+        return None
 
     def _check_declared_version(self) -> None:
         """声明版本高于实际服务端时立即报错（配置与现实不符）。"""
@@ -656,6 +794,8 @@ class RedisDriver(NoSQLDriver):
             finally:
                 self._client = None
                 self._detected_version = None
+                self._db = None
+                self._server_databases = None
 
     def ping(self) -> bool:
         """连接是否可用（未连接时先建立连接）。"""
@@ -680,7 +820,25 @@ class RedisDriver(NoSQLDriver):
         return self.connect()
 
     def __repr__(self) -> str:  # pragma: no cover - 调试用
-        return f"<RedisDriver db{self.config.database} v{self.version}>"
+        return f"<RedisDriver db{self.db} v{self.version}>"
+
+
+def _db_from_url(url: Any) -> Optional[int]:
+    """从连接串路径取出 db 序号（``redis://h:6379/2`` -> 2）。
+
+    ``redis-py`` 在 ``from_url`` 时就按路径里的 ``/N`` SELECT，因此本层的
+    "生效 db"必须与它一致；解析不出来时返回 None（交给配置字段决定）。
+    """
+    if not url:
+        return None
+    try:
+        parsed = urlsplit(str(url))
+    except ValueError:
+        return None
+    segment = (parsed.path or "").strip("/").split("/")[0]
+    if not segment.isdigit():
+        return None
+    return int(segment)
 
 
 def _looks_like_int(value: Any) -> bool:

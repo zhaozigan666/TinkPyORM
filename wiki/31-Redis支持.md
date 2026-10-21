@@ -37,14 +37,68 @@ Db.config({"type": "redis",
            "options": {"url": "redis://:secret@127.0.0.1:6379/0"}})
 ```
 
-### 1.1 `database` 是 db 序号
+### 1.1 `database` 是 db 序号（默认 16 个，0–15）
 
-Redis 的 ``database`` 与 SQL 的"库名"完全不同：它是 **0–15 的整数序号**
-（由服务端 ``databases`` 配置决定，默认 16 个）。因此：
+Redis 的 ``database`` 与 SQL 的"库名"完全不同：它是 **db 序号**，服务端默认
+配置 **16 个 db（0–15）**，可用 ``databases`` 指令调整。db 之间**互不可见**，
+常用来隔离环境（如 0=生产、1=测试）。
 
-- 必须能转成整数，否则**配置期直接报错**（不会静默当成 0）；
-- `Config` 的默认值 `":memory:"` 对 Redis 而言等于"未设置"，会回落到 0 或环境变量；
-- 集群模式（`cluster_enabled=1`）只有 db 0，`SELECT` 不可用。
+**四种指定方式，完全等价**：
+
+```python
+Db.config({"type": "redis", "host": "h", "password": "p", "database": 3})
+
+Db.config({"type": "redis", "host": "h", "password": "p",
+           "options": {"db": 3}})                       # redis-py 的写法
+
+Db.config({"type": "redis",
+           "options": {"url": "redis://:p@h:6379/3"}})  # URL 路径里的 /N
+
+os.environ["REDIS_DB"] = "3"                            # 环境变量
+```
+
+配置中心回调同样可以返回 ``db`` 或 ``database``：
+
+```python
+Db.config({"type": "redis",
+           "options": {"config_resolver": lambda: {"db": 3}}})
+```
+
+**规则**：
+
+| 场景 | 行为 |
+|---|---|
+| 只给一个来源 | 用它 |
+| 多个来源**一致**（如 `database=3` + `options={"db": "3"}`） | 通过 |
+| 多个来源**不一致**（如 `database=3` + `options={"db": 5}`） | **报错**，列出全部来源，不静默取一个 |
+| 都没给 | 默认 db 0 |
+| 非整数（`"app"`、`":memory:"` 除外） | 配置期报错（`":memory:"` 视为未设置） |
+| 负数 | 配置期报错 |
+| 超出服务端 db 数（如 20） | 连接期报错，并说明服务端实际 db 数 |
+| 集群模式 + 非 0 | 连接期报错（集群只有 db 0） |
+
+越界报错长这样（连上后由 `CONFIG GET databases` 取真实数量）：
+
+```
+InvalidArgumentException: Redis db 序号越界：配置的是 20，
+而服务端只配置了 16 个 db（0–15）；请修正 database（服务端可用 databases 指令扩容）
+```
+
+**查看当前生效的 db**：
+
+```python
+driver = Db.get_connection().driver
+driver.db                  # -> 3（配置解析值 / 连接后为实际值）
+driver.server_databases     # -> 16（连接后由 CONFIG GET databases 探测，无权限时 None）
+Db.redis("app:").db()       # -> 3
+driver.dialect_info()["db"]  # -> 3
+```
+
+> **两处易踩的坑**：
+> 1. `database` 不是"库名"，写 `"app"` 会直接报错——要分环境请建多个 db 或
+>    用键前缀（`Db.redis("prod:")`），不要试图用库名。
+> 2. 同一个 Redis 实例的**所有 db 共用一个内存上限与淘汰策略**，`maxmemory`
+>    是实例级的；用 db 隔离环境只隔离键空间，不隔离资源。
 
 ### 1.2 配置来源优先级
 
@@ -417,9 +471,9 @@ except QueryError as exc:                    # WRONGTYPE 也归到这里
 
 **已实测**（v0.13.0）：
 
-- **114 项离线测试**（`test_redis.py`）：假 redis 客户端记录每次调用，
+- **136 项离线测试**（`test_redis.py`）：假 redis 客户端记录每次调用，
   覆盖版本解析/能力矩阵/配置优先级/参数校验/异常翻译/键前缀/流水线规则；
-- **59 项真实服务端集成测试**（`test_redis_live.py`，需环境变量
+- **66 项真实服务端集成测试**（`test_redis_live.py`，需环境变量
   `TINKPYORM_REDIS_TEST_URL`，未设置则整份跳过）：
   实测服务端 **Redis 8.10.2**（standalone，16 db），覆盖五种数据类型、
   哈希字段级过期、流水线原子性、发布订阅、WRONGTYPE 与认证失败翻译；

@@ -61,6 +61,10 @@ def _connect(**overrides):
     data.update(overrides)
     options = {"socket_connect_timeout": 8, "socket_timeout": 8}
     options.update(data.pop("options", {}))
+    if ("db" in options or "database" in options) and "database" not in overrides:
+        # URL 里带的 db 会与 options 里的 db 冲突（驱动会拒绝不一致的配置），
+        # 这里以 options 为准：去掉从 URL 解析出来的 database。
+        data.pop("database", None)
     data["options"] = options
     return _Db.config(data)
 
@@ -523,6 +527,87 @@ class TestLiveErrors(LiveBase):
         store.set("it:bytes", "v")
         self.assertEqual(store.get("it:bytes"), b"v")
         store.delete("it:bytes")
+
+
+# ---------------------------------------------------------------------- #
+# 8. 选择 db（默认 16 个）
+# ---------------------------------------------------------------------- #
+class TestLiveDbSelection(LiveBase):
+    """在真实服务端上验证 db 选择、隔离与越界报错。"""
+
+    def _independent_store(self, db_index):
+        """建立**独立连接**（不覆盖 Db 的默认连接），用于跨 db 对比。"""
+        from tinkpyorm import RedisStore, Connection
+        from tinkpyorm.config import Config
+        data = {"type": "redis"}
+        data.update(_parts())
+        data["database"] = db_index
+        data["options"] = {"socket_connect_timeout": 8, "socket_timeout": 8}
+        conn = Connection.from_config(Config.from_dict(data))
+        return conn, RedisStore(conn, PREFIX)
+
+    def test_db_from_config_field(self):
+        conn = _connect(database=3)
+        conn.driver.connect()
+        self.assertEqual(conn.driver.db, 3)
+
+    def test_db_alias_from_options(self):
+        conn = _connect(options={"db": 3, "socket_connect_timeout": 8,
+                                 "socket_timeout": 8})
+        conn.driver.connect()
+        self.assertEqual(conn.driver.db, 3)
+        self.assertEqual(_Db.redis(PREFIX).db(), 3)
+
+    def test_server_databases_detected(self):
+        self.driver.connect()
+        self.assertEqual(self.driver.server_databases, 16)
+
+    def test_db_isolation(self):
+        """db 3 写入的键在 db 0 不可见（同一个键名也不串）。"""
+        conn3, store3 = self._independent_store(3)
+        conn0, store0 = self._independent_store(0)
+        try:
+            store3.clear("it:*")
+            store0.clear("it:*")
+            store3.set("it:only_db3", "v3")
+            self.assertEqual(store3.get("it:only_db3"), "v3")
+            self.assertIsNone(store0.get("it:only_db3"))
+        finally:
+            store3.clear("it:*")
+            store0.clear("it:*")
+            conn3.close()
+            conn0.close()
+
+    def test_out_of_range_db_rejected(self):
+        """服务端默认 16 个 db，db=200 必须在连接期被拦下并说明范围。"""
+        conn = _connect(database=200)
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver.connect()
+        message = str(ctx.exception)
+        self.assertIn("越界", message)
+        self.assertIn("200", message)
+        self.assertFalse(conn.driver.is_connected())
+
+    def test_conflicting_db_values_rejected(self):
+        conn = _connect(database=3,
+                        options={"db": 5, "socket_connect_timeout": 8,
+                                 "socket_timeout": 8})
+        with self.assertRaises(InvalidArgumentException) as ctx:
+            conn.driver.connect()
+        self.assertIn("不一致", str(ctx.exception))
+
+    def test_url_db_is_honored(self):
+        """连接串里的 /db 由 redis-py 解析，driver.db 也应反映出来。"""
+        Db.close()
+        Db._prefix = ""
+        parts = _parts()
+        url = (f"redis://:{parts['password']}@{parts['host']}:{parts['port']}/4"
+               if parts["password"] else
+               f"redis://{parts['host']}:{parts['port']}/4")
+        conn = Db.config({"type": "redis", "options": {
+            "url": url, "socket_connect_timeout": 8, "socket_timeout": 8}})
+        conn.driver.connect()
+        self.assertEqual(conn.driver.db, 4)
 
 
 if __name__ == "__main__":

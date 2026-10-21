@@ -138,7 +138,7 @@ from .versioning import (
     DEFAULT_REDIS_VERSION, MYSQL_SUPPORTED, MONGO_SUPPORTED, REDIS_SUPPORTED,
 )
 
-__version__ = "0.13.0"
+__version__ = "0.13.1"
 
 
 __all__ = [

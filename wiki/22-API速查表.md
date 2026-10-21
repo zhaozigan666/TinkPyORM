@@ -104,4 +104,4 @@
 | `json` | False | 自动建表/建列模式（[27-JSON自动建表](27-JSON自动建表.md)） |
 | `cache_backend` / `cache_dir` | memory / - | 查询缓存后端：`memory` / `file`（file 须提供目录，见 [19-查询缓存](19-查询缓存.md)） |
 | `version` | 5.7.0 / 4.0.0 / 7.0.0 | 数据库产品版本：MySQL / MongoDB / Redis 各自消费（[29](29-MySQL支持.md) / [30](30-MongoDB支持.md) / [31](31-Redis支持.md)） |
-| `database`（Redis） | 0 | **db 序号**（0–15），不是库名；非整数直接报错 |
+| `database` / `options.db`（Redis） | 0 | **db 序号**（默认 16 个：0–15），不是库名；两种写法等价，与 URL 的 `/N` 冲突时直接报错（[31](31-Redis支持.md)） |
