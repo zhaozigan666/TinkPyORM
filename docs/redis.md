@@ -182,8 +182,9 @@ def _call(fn, *args, **kwargs):
 
 ## 9. 真实服务端验证
 
-在 `s10.z100.vip:31568`（Redis **8.10.2**，standalone，16 db，已加载
-bf / vectorset / timeseries / search / ReJSON 模块）上跑 59 项集成测试。
+在一台真实的 Redis **8.10.2**（standalone，16 db，已加载 bf / vectorset /
+timeseries / search / ReJSON 模块）上跑 59 项集成测试；凭据只经环境变量
+`TINKPYORM_REDIS_TEST_URL` 传入，测试文件与文档均不含主机与密码。
 
 暴露并修复的问题：
 
