@@ -467,3 +467,63 @@ JSON 列在 SQLite 中以 TEXT 存储。`json_set` 返回的是**新的完整文
 属 Python 层实现语言的固有成本，继续优化需要改设计（如字段描述符），不建议在
 SQLite 场景为此牺牲灵活性。若单进程要遍历百万级行的字段，应优先用
 `Db.table(...).cursor()` 直接拿 dict，绕开模型层。
+
+---
+
+## 十四、v0.13.2 追加：导入惰性化与标识符引用缓存（实测）
+
+环境：本机 Windows 11 / Python 3.13.14 / SQLite 3.53.1，与 §13 同机同法。
+改动依据《TinkPyORM 性能分析报告》（2026-10-24）。备份：`_backup_TinkPyORM_p0_20261024/`。
+
+### 14.1 导入开销：净增 800 ms → 436 ms（−46%）
+
+三项改动（`__init__.py` / `config.py` / `cache.py`，均为独立 PR 粒度）：
+
+| 改动 | importtime 归因 | 削减 |
+|---|---|---|
+| `__init__` 惰性导出 mongo/redis/fts/document/cache（PEP 562，`__all__`/`from X import` 语义不变） | mongo 链 80.5 ms + redis 36.8 ms 等 | ~165 ms |
+| `Config` 由 `@dataclass` 改普通类（字段顺序/默认值不变，全库无 dataclass 内省用法，已核实） | dataclasses+inspect 链 151.1 ms | ~151 ms |
+| `tempfile` 从 cache.py 顶层下沉到 `FileCacheStore` 原子写入处 | tempfile 链 97.2 ms | ~97 ms |
+
+子进程 5 次中位数：`import tinkpyorm` 净增 **797.6/801.9 ms → 436.3 ms**。
+`tinkpyorm` 包自身累计导入 507.6 → 224 ms；`config` 链 158.8 → 5.6 ms。
+剩余大头：`typing` 70 ms（运行时引用，下沉 `TYPE_CHECKING` 留作后续独立 PR）、
+`json`（query/builder 必需）。
+
+> 澄清：基线 `pass` 进程的导入树中同样存在 tempfile/socket/json/shutil
+> （来自用户环境 sitecustomize），这部分本就计入基线，不属于 ORM 净增。
+
+### 14.2 P1 门槛裁定：原三个嫌疑项无罪，真实热点在别处
+
+按方案先复测再立项（空闲机器，同法）：
+
+- S4 点查 ORM÷A = 1.54×（基线 1.53×）——读路径未变重；
+- cProfile `find`×100000：方案点名的 `_apply_soft_delete` / `_auto_json_table` /
+  `_resolve_cache_key` 均未进入热点前 20（合计占比 < 10%）——**门槛裁定不通过，P1-1 原范围降级不做**；
+- 真实热点（按 tottime）：`builder.select` SQL 生成本身（cumtime 占 42%）、
+  `sqlite3.execute`（真实工作）、`Query.__init__` 与 `Db.table` 对象构造（~12%）、
+  `sql_log._log`（默认开启，可关）。
+
+### 14.3 写路径剖析与唯一实施的微优化
+
+事务内逐条插入比值较基线变重（3.95× → 8.3×，其中机器因素约 2.3×），逐函数剖析
++ 裸微基准（不开剖析器）定位三项候选：
+
+| 候选点 | 裸实测成本/条 | 裁定 |
+|---|---|---|
+| `quote_identifier` ×7/条（表名+6 列名，每次 re.match+拆分） | **7.81 µs** | ✅ 修复：Driver 实例级备忘录缓存（仅缓存合法标识符分支，表达式不缓存防键无界；MySQL 等方言只覆写 `_wrap_identifier`，缓存层对全部驱动正确） |
+| 写失效链 `_cache.clear` + fts `invalidate_dependents`（空缓存） | 1.80 µs | ❌ 低于 5 µs 停损线，不动（避免为 <2 µs 给文件后端引入额外目录扫描） |
+| `Query.__init__`/`Db.table` 对象构造 | 6.25 µs | ❌ 结构性成本，动它需改 API，不做 |
+
+**修复后**：quote 链 7.81 → **3.11 µs/条**（−60%）。端到端复测（同法、同轮）：
+
+| 场景 | 修复前 | 修复后 | 变化 |
+|---|---|---|---|
+| S3 事务内逐条插入 20000 | 69.01 µs/op | **62.49 µs/op** | −9.4%（ORM÷A 8.3× → 7.2×） |
+| S4 主键点查 20000 | 234.82 µs/op | **224.83 µs/op** | −4.3%（ORM÷A 1.54× → 1.53×） |
+
+### 14.4 验证
+
+13 个测试文件逐文件运行全绿 + `test_readme_examples` 174 项 + smoke 全过。
+已知边界（非本次引入）：同一 `Query` 实例重复调用 `find()` 会累积条件
+（每次应经 `Db.table()` 新建），属既有语义。

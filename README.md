@@ -231,6 +231,18 @@ User.destroy(user.id)                                  # 删除
 
 ## 更新记录
 
+### v0.13.2
+
+导入性能优化、配置凭证脱敏与查询缓存模块拆分。
+
+- `import tinkpyorm` 净导入耗时约 800ms → 436ms：`mongo` / `redis` / `fts` / `document` / `cache` 的公开符号改为 PEP 562 惰性导出；`Config` 移除 `@dataclass`；`tempfile` 导入下沉到文件缓存后端
+- `Config.to_dict()` 新增 `mask_secrets` 参数（默认 `True`）：`password` 输出 `"***"`，明文需显式传 `mask_secrets=False`
+- 新增 `tinkpyorm/query_cache.py`（`QueryCacheMixin`）：查询缓存的配置解析 / 键生成 / 写入 / 失效自 `Query` 拆出，`Query` 改为混入
+- `Driver.quote_identifier` 对合法标识符分支增加实例级备忘录缓存，SQL 生成中的标识符引用成本约 -60%（事务内逐条插入 -9.4%，主键点查 -4.3%）
+- 异常捕获收窄：`Model._get_fields` 为 `(OrmError, sqlite3.Error)`；Redis 驱动 db 序号解析为 `(KeyError, TypeError, ValueError)`；MySQL / MongoDB / Redis 驱动的 `parse_version` 探测点为 `InvalidArgumentException`
+- 补齐公共方法缺失的类型注解：`Model.fts_index` / `Model.search` / `Model.paginate` / `DocumentCollection.select` / `Relation` 定义方法 / `register_driver`
+- 测试：新增 builder / config / versioning / utils 独立单测 67 项（共 **879 项单元测试** + 174 项示例）；`unittest discover` 全量运行 0 失败（98 项 live 测试按凭据跳过）；全局状态卫生约定写入 wiki/25；`test_readme_examples.py` 更名 `check_readme_examples.py`（脚本，discover 不收集）；smoke_test 死代码清理
+
 ### v0.13.1
 
 Redis 支持手动指定 db 序号（默认 16 个 db：0–15）。

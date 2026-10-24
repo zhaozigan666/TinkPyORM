@@ -5,7 +5,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from tinkpyorm import Db, Model, raw
 
-Db.set_config({':memory:': ':memory:'} if False else '')
 # 使用独立连接
 from tinkpyorm.connection import Connection
 Db.set_config(Connection(':memory:'))

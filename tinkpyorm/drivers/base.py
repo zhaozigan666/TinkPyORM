@@ -97,6 +97,10 @@ class Driver(abc.ABC):
 
     def __init__(self, config: Config) -> None:
         self.config = config
+        #: 标识符引用备忘录（v0.13.2）：schema 内标识符集合有限，
+        #: 命中后跳过 re.match 与逐段拆分。仅缓存合法标识符分支，
+        #: 表达式不缓存以防键无界增长。
+        self._quote_cache: Dict[str, str] = {}
 
     # ------------------------------------------------------------------ #
     # 能力询问（v0.11.0）
@@ -238,12 +242,22 @@ class Driver(abc.ABC):
         s = name.strip()
         if s == "*":
             return "*"
+        # 备忘录快路径（v0.13.2）：热路径上同一名（表名/列名）在单条
+        # SQL 内会被引用多次（如 insert 的表名 + 每个列名），缓存可省去
+        # 重复的 re.match 与拆分。dict 读写受 GIL 保护，最坏情形是
+        # 多线程下重复计算一次，结果一致，无正确性风险。
+        cached = self._quote_cache.get(s)
+        if cached is not None:
+            return cached
         if _IDENT_RE.match(s):
-            return self._wrap_identifier(s)
-        if "." in s and all(_IDENT_RE.match(p) for p in s.split(".") if p):
-            return ".".join(self._wrap_identifier(p) for p in s.split("."))
-        # 表达式原样返回（防注入由参数绑定层保证）
-        return s
+            result = self._wrap_identifier(s)
+        elif "." in s and all(_IDENT_RE.match(p) for p in s.split(".") if p):
+            result = ".".join(self._wrap_identifier(p) for p in s.split("."))
+        else:
+            # 表达式原样返回（防注入由参数绑定层保证），不进缓存
+            return s
+        self._quote_cache[s] = result
+        return result
 
     def _wrap_identifier(self, name: str) -> str:
         """各驱动覆写此方法以提供方言级引号。"""

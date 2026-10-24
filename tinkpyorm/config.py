@@ -16,7 +16,6 @@ v0.3.1 起撤销"集中式配置"（Config/DatabaseManager/DSN/环境变量/配�
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
 from typing import Any, Dict, Mapping, Optional
 
 from .exceptions import InvalidArgumentException
@@ -140,46 +139,72 @@ def normalize_type(value: Optional[str]) -> str:
         f"自定义驱动需先注册: register_driver({raw!r}, YourDriver)")
 
 
-@dataclass
 class Config:
-    """数据库连接配置（值对象，构造时不建立连接）。"""
+    """数据库连接配置（值对象，构造时不建立连接）。
 
-    type: str = DEFAULT_TYPE
-    database: str = ":memory:"
-    host: Optional[str] = None
-    port: Optional[int] = None
-    user: Optional[str] = None
-    password: Optional[str] = None
-    prefix: str = ""
-    #: 数据库产品版本。MySQL（v0.11.0）、MongoDB（v0.12.0）、Redis（v0.13.0）
-    #: 各自消费：``"8.0.36"`` / ``"7.0"`` / ``"7.4"``。缺省分别为 5.7.0 /
-    #: 4.0.0 / 7.0.0；SQLite 忽略本字段（版本由运行时决定）。
-    #: 接受 str / int / float / (major, minor[, patch])，解析规则见
-    #: :mod:`tinkpyorm.versioning`。MongoDB / Redis 还会用探测到的服务端
-    #: 版本覆盖声明值（声明高于实际时在连接期报错）。
-    version: Optional[Any] = None
-    #: 驱动专属参数（如 SQLite 的 timeout/journal_mode，MySQL 的 charset）
-    options: Dict[str, Any] = field(default_factory=dict)
-    sql_log_enabled: bool = True
-    sql_log_max: Optional[int] = 1000
-    connect_timeout: Optional[float] = None
-    path_expand: bool = True
-    #: 文档集合（DocumentCollection）写入期 schema 校验开关（v0.8.0）。
-    #: 开启时对已声明路径上的值做类型校验；关闭时 schema 声明仅作文档。
-    collection_schema_mode: bool = False
-    #: JSON 自动建表/建列模式（v0.9.0）。开启后 ``Db.table()`` / ``Db.name()``
-    #: 遇到不存在的表自动创建（``id`` 自增主键），insert/insert_all 插入
-    #: dict 数据时缺失字段自动 ``ALTER TABLE ADD COLUMN``（按值推断类型，
-    #: dict/list 存为 JSON 文本）。仅对单表查询生效，默认关闭。
-    json: bool = False
-    #: 查询缓存后端（v0.9.1）：``"memory"`` 进程内存（默认），
-    #: ``"file"`` 本地文件缓存（进程重启后仍在，跨进程共享）。
-    cache_backend: str = "memory"
-    #: 文件缓存的目录（``cache_backend="file"`` 时必填）。
-    #: 目录不存在会自动创建；过期条目在读取时与启动时自动清理。
-    cache_dir: Optional[str] = None
+    v0.13.2 起为普通类（原为 ``@dataclass``）：dataclass 在导入期拖入
+    ``dataclasses`` + ``inspect`` 链（importtime 实测约 150 ms，为单条
+    最大导入热点），而本类仅作内部值对象使用。手工 ``__init__`` 的字段
+    顺序与默认值与原 dataclass 完全一致，位置/关键字构造均可。
+    """
 
-    def __post_init__(self) -> None:
+    def __init__(
+        self,
+        type: str = DEFAULT_TYPE,
+        database: str = ":memory:",
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        user: Optional[str] = None,
+        password: Optional[str] = None,
+        prefix: str = "",
+        #: 数据库产品版本。MySQL（v0.11.0）、MongoDB（v0.12.0）、Redis（v0.13.0）
+        #: 各自消费：``"8.0.36"`` / ``"7.0"`` / ``"7.4"``。缺省分别为 5.7.0 /
+        #: 4.0.0 / 7.0.0；SQLite 忽略本字段（版本由运行时决定）。
+        #: 接受 str / int / float / (major, minor[, patch])，解析规则见
+        #: :mod:`tinkpyorm.versioning`。MongoDB / Redis 还会用探测到的服务端
+        #: 版本覆盖声明值（声明高于实际时在连接期报错）。
+        version: Optional[Any] = None,
+        #: 驱动专属参数（如 SQLite 的 timeout/journal_mode，MySQL 的 charset）
+        options: Optional[Dict[str, Any]] = None,
+        sql_log_enabled: bool = True,
+        sql_log_max: Optional[int] = 1000,
+        connect_timeout: Optional[float] = None,
+        path_expand: bool = True,
+        #: 文档集合（DocumentCollection）写入期 schema 校验开关（v0.8.0）。
+        #: 开启时对已声明路径上的值做类型校验；关闭时 schema 声明仅作文档。
+        collection_schema_mode: bool = False,
+        #: JSON 自动建表/建列模式（v0.9.0）。开启后 ``Db.table()`` / ``Db.name()``
+        #: 遇到不存在的表自动创建（``id`` 自增主键），insert/insert_all 插入
+        #: dict 数据时缺失字段自动 ``ALTER TABLE ADD COLUMN``（按值推断类型，
+        #: dict/list 存为 JSON 文本）。仅对单表查询生效，默认关闭。
+        json: bool = False,
+        #: 查询缓存后端（v0.9.1）：``"memory"`` 进程内存（默认），
+        #: ``"file"`` 本地文件缓存（进程重启后仍在，跨进程共享）。
+        cache_backend: str = "memory",
+        #: 文件缓存的目录（``cache_backend="file"`` 时必填）。
+        #: 目录不存在会自动创建；过期条目在读取时与启动时自动清理。
+        cache_dir: Optional[str] = None,
+    ):
+        self.type = type
+        self.database = database
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.prefix = prefix
+        self.version = version
+        self.options = options if options is not None else {}
+        self.sql_log_enabled = sql_log_enabled
+        self.sql_log_max = sql_log_max
+        self.connect_timeout = connect_timeout
+        self.path_expand = path_expand
+        self.collection_schema_mode = collection_schema_mode
+        self.json = json
+        self.cache_backend = cache_backend
+        self.cache_dir = cache_dir
+        self._normalize()
+
+    def _normalize(self) -> None:
         self.type = normalize_type(self.type)
         self.prefix = str(self.prefix or "")
         if self.port is not None:
@@ -246,7 +271,13 @@ class Config:
     # ------------------------------------------------------------------ #
     # 输出
     # ------------------------------------------------------------------ #
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, mask_secrets: bool = True) -> Dict[str, Any]:
+        """导出为字典。
+
+        ``password`` 默认掩码为 ``"***"``（防止日志 / 调试 dump 配置时
+        泄漏凭证）；确需明文（如 ``from_dict`` 往返重建）时传
+        ``mask_secrets=False``。其余键不含敏感信息，始终原样输出。
+        """
         data = {
             "type": self.type,
             "database": self.database,
@@ -262,7 +293,11 @@ class Config:
         }
         for key in ("host", "port", "user", "password"):
             value = getattr(self, key)
-            if value is not None:
+            if value is None:
+                continue
+            if key == "password" and mask_secrets:
+                data[key] = "***"
+            else:
                 data[key] = value
         if self.options:
             data["options"] = dict(self.options)

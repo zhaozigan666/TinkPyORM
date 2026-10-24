@@ -110,12 +110,10 @@ Redis 键空间（v0.13.0）—— 命名空间前缀 + 键值/哈希/列表/集
 到建立连接时才抛 ``DriverNotAvailable``。
 """
 from .builder import JsonWhere, JsonUpdate, JSON_OPS, JSON_UPDATE_MODES
-from .cache import CacheStore, MemoryCacheStore, FileCacheStore
 from .collection import Collection, Paginator
 from .config import available_type_names
 from .connection import Connection
 from .db import Db
-from .document import DocumentCollection
 from .drivers import (
     Driver, SQLDriver, NoSQLDriver, SQLiteDriver,
     UnsupportedOperation, register_driver, get_driver, available_drivers,
@@ -126,9 +124,6 @@ from .exceptions import (
     RelationNotFound, TransactionError, InvalidArgumentException,
     DriverNotAvailable,
 )
-from .fts import FtsIndex, FtsQuery, fts_quote, DEFAULT_TOKENIZE
-from .mongo import MongoCollection, MONGO_OPS
-from .redis import RedisStore, RedisPipeline, RedisSubscription
 from .model import Model
 from .query import Query
 from .relation import Relation
@@ -138,7 +133,37 @@ from .versioning import (
     DEFAULT_REDIS_VERSION, MYSQL_SUPPORTED, MONGO_SUPPORTED, REDIS_SUPPORTED,
 )
 
-__version__ = "0.13.1"
+__version__ = "0.13.2"
+
+# ---- 惰性导出（PEP 562）------------------------------------------------
+# mongo / redis / fts / document / cache 五个模块的符号改为按需导入：
+# 纯 SQLite 核心用法（Db/Model/Query）在 import tinkpyorm 时不再付出这些
+# 模块及其传递依赖（typing/tempfile/ctypes 等）的导入成本。
+# 语义不变：`from tinkpyorm import MongoCollection`、`hasattr`、`__all__`
+# 均照常工作；首次访问后缓存进 globals()，后续访问零开销。
+_LAZY_EXPORTS = {
+    "MongoCollection": "mongo", "MONGO_OPS": "mongo",
+    "RedisStore": "redis", "RedisPipeline": "redis", "RedisSubscription": "redis",
+    "FtsIndex": "fts", "FtsQuery": "fts", "fts_quote": "fts",
+    "DEFAULT_TOKENIZE": "fts",
+    "DocumentCollection": "document",
+    "CacheStore": "cache", "MemoryCacheStore": "cache", "FileCacheStore": "cache",
+}
+
+
+def __getattr__(name: str):
+    mod_name = _LAZY_EXPORTS.get(name)
+    if mod_name is None:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+    value = getattr(importlib.import_module("." + mod_name, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
 __all__ = [

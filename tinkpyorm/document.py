@@ -47,13 +47,16 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, TYPE_CHECKING
 
 from .builder import JSON_OPS
 from .drivers import UnsupportedOperation, normalize_json_path
 from .exceptions import InvalidArgumentException, QueryError
 from .query import Query
 from .utils import UNSET
+
+if TYPE_CHECKING:
+    from .collection import Collection
 
 _UNSET = UNSET
 
@@ -315,7 +318,7 @@ class DocumentCollection:
         doc.update(data)
         return doc
 
-    def select(self):
+    def select(self) -> "Collection":
         """查询文档列表，返回结果集 Collection（元素为文档 dict）。"""
         self._ensure_table()
         rows = self._q().select()

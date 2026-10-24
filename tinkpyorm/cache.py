@@ -20,7 +20,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -260,6 +259,10 @@ class FileCacheStore(CacheStore):
             while self.max_items and len(entries) >= self.max_items:
                 self._remove(entries.pop(0))
             path = self._path(key)
+            # 惰性导入（v0.13.2）：tempfile 会拖入 shutil 等传递依赖
+            # （importtime 实测约 97 ms），且仅文件后端的原子写入用到，
+            # 内存后端（默认）完全不需要，故下沉到此处。
+            import tempfile
             fd, tmp = tempfile.mkstemp(dir=self.cache_dir, suffix=".tmp")
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:

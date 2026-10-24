@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Dict, List, Optional, Type
+from typing import Callable, Dict, List, Optional, Type, Union
 
 from ..exceptions import DriverNotAvailable
 from .base import (
@@ -48,7 +48,9 @@ _INSTALL_HINTS: Dict[str, str] = {
 }
 
 
-def register_driver(name: str, driver_cls: Optional[Type[Driver]] = None):
+def register_driver(name: str, driver_cls: Optional[Type[Driver]] = None
+                    ) -> Union[Type[Driver],
+                               Callable[[Type[Driver]], Type[Driver]]]:
     """注册驱动。可作为装饰器使用::
 
         @register_driver("postgres")

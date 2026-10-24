@@ -680,8 +680,9 @@ class MongoDBDriver(NoSQLDriver):
             return None
         try:
             return parse_version(str(raw), product="mongodb")
-        except Exception:
+        except InvalidArgumentException:
             # 版本号形态超出支持范围时不阻断连接，退化为 wire 下界
+            # （parse_version 的唯一异常类型；其他异常应向上暴露）
             return None
 
     def _version_from_wire_command(self) -> Optional[Version]:

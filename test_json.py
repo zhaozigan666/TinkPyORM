@@ -541,7 +541,10 @@ class TestDriverContract(unittest.TestCase):
         self.assertEqual(d.json_decode(None), None)
 
     def test_unsupported_driver_raises(self):
+        from tinkpyorm.drivers.mysql import MySQLDriver
         register_driver("mysql", _NoJsonDriver)
+        # 注册表是全局的：不恢复会毒害 discover 下后运行的 test_mysql
+        self.addCleanup(register_driver, "mysql", MySQLDriver)
         conn = Connection(config=Config(database=":memory:", type="mysql"))
         q = Query(conn, table="t")
         with self.assertRaises(UnsupportedOperation):
@@ -1665,7 +1668,9 @@ class TestJsonWriteDriverContract(unittest.TestCase):
 
     def test_unsupported_driver_write_raises(self):
         from tinkpyorm import SQLiteDriver
+        from tinkpyorm.drivers.mysql import MySQLDriver
         register_driver("mysql", _NoJsonDriver)
+        self.addCleanup(register_driver, "mysql", MySQLDriver)
         conn = Connection(config=Config(database=":memory:", type="mysql"))
         q = Query(conn, table="t")
         with self.assertRaises(UnsupportedOperation):

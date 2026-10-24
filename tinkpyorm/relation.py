@@ -218,7 +218,9 @@ def _unique(items: List[Any]) -> List[Any]:
 def _relation_method(type_: str):
     """生成关联定义方法的工厂（has_one / has_many / ...）。"""
 
-    def define(self, target, foreign_key=None, local_key=None, middle=None):
+    def define(self, target: Any, foreign_key: Optional[str] = None,
+               local_key: Optional[str] = None,
+               middle: Optional[str] = None) -> "Relation":
         return Relation(self, target, type_, foreign_key, local_key, middle)
 
     define.__name__ = type_

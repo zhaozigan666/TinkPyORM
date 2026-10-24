@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tinkpyorm"
-version = "0.13.1"
+version = "0.13.2"
 description = "参考 think-orm 设计、纯标准库实现的 SQLite ORM（链式查询 / ActiveRecord / JSON / 文档集合 / FTS5）；附 MySQL 5.7–9.x 方言、MongoDB 4.0–8.x 与 Redis 4.0–8.x 数据访问层"
 readme = "README.md"
 requires-python = ">=3.8"

@@ -11,13 +11,17 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import date, datetime, time as dtime
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING, Union
 
-from .collection import Collection
+from .collection import Collection, Paginator
 from .exceptions import OrmError, QueryError, RelationNotFound
 from .relation import Relation, HAS_ONE, HAS_MANY, BELONGS_TO, BELONGS_TO_MANY
 from .utils import UNSET as _UNSET, to_snake
+
+if TYPE_CHECKING:
+    from .fts import FtsIndex, FtsQuery
 
 _GETTER_PREFIXES = ("get_", "set_", "on_", "scope_", "search_", "_")
 
@@ -176,6 +180,11 @@ class Model(metaclass=MetaModel):
                     try:
                         result = method(self)
                     except Exception:
+                        # 必须保持宽捕获：此处包裹的是属性访问期被"探针式"
+                        # 调用的用户方法（think-orm 兼容魔法），用户代码可能
+                        # 抛出任意异常（如未保存模型的 AttributeError）；任何
+                        # 异常一律按"不是关联方法"降级，收窄会把它变成
+                        # 属性访问失败，破坏兼容语义。
                         result = None
                     if isinstance(result, Relation):
                         cache[name] = True
@@ -213,6 +222,8 @@ class Model(metaclass=MetaModel):
                 try:
                     result = method(self)
                 except Exception:
+                    # 同 __getattribute__：包裹用户关联方法，必须保持宽捕获
+                    # （详见该处注释），异常一律按"非关联赋值"降级。
                     result = None
                 if isinstance(result, Relation):
                     self._relation[name] = value
@@ -323,7 +334,11 @@ class Model(metaclass=MetaModel):
         if cls.__fields_cache__ is None:
             try:
                 cls.__fields_cache__ = cls._connection().table_fields(cls._table_name())
-            except Exception:
+            except (OrmError, sqlite3.Error):
+                # 预期内的探测失败：NoSQL 驱动未实现（UnsupportedOperation）、
+                # 表尚不存在 / 连接异常（sqlite3.Error）。降级为"字段未知"，
+                # _has_field 据此放行（宽松语义）。驱动代码内的其他异常
+                # （如 TypeError 等编程错误）不在此列，直接向上暴露。
                 cls.__fields_cache__ = None
         return cls.__fields_cache__
 
@@ -355,7 +370,7 @@ class Model(metaclass=MetaModel):
     # 全文检索（v0.10.0，需声明 __fts__）
     # ------------------------------------------------------------------ #
     @classmethod
-    def fts_index(cls):
+    def fts_index(cls) -> "FtsIndex":
         """返回本模型的 FTS 索引门面（建索引/重建/维护入口）。
 
         声明方式::
@@ -382,7 +397,7 @@ class Model(metaclass=MetaModel):
                         model=cls)
 
     @classmethod
-    def search(cls, query: str):
+    def search(cls, query: str) -> "FtsQuery":
         """全文检索入口，返回绑定了本模型的检索链::
 
             Doc.search("索引").rank().limit(10).select()   # Collection[Doc]
@@ -454,7 +469,8 @@ class Model(metaclass=MetaModel):
         return cls.query().min(field)
 
     @classmethod
-    def paginate(cls, list_rows: int = 15, page: Optional[int] = None):
+    def paginate(cls, list_rows: int = 15,
+                 page: Optional[int] = None) -> Paginator:
         return cls.query().paginate(list_rows, page)
 
     # ------------------------------------------------------------------ #

@@ -324,7 +324,9 @@ class RedisDriver(NoSQLDriver):
             return self._db
         try:
             return int(self._resolve_settings()["database"])
-        except Exception:
+        except (KeyError, TypeError, ValueError):
+            # 仅自家纯函数的解析失败（配置缺失/类型不对）降级为 0；
+            # 其他异常不属于"配置非法"，应向上暴露
             return 0
 
     @property
@@ -673,13 +675,13 @@ class RedisDriver(NoSQLDriver):
                 try:
                     self._detected_version = parse_version(
                         str(raw), product="redis")
-                except Exception:
+                except InvalidArgumentException:
                     # 版本号超出支持范围时不阻断连接（例如 8.10.2 这种
                     # 快速发布线），只记录、不参与门禁
                     try:
                         self._detected_version = parse_version(
                             str(raw), product="generic")
-                    except Exception:
+                    except InvalidArgumentException:
                         self._detected_version = None
             self._topology = self._classify_topology(info)
             databases = info.get("databases")

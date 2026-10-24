@@ -17,6 +17,22 @@ class _Base(unittest.TestCase):
         Db.close()
 
 
+def _reset_global_db():
+    """恢复全局 Db 状态（表前缀是粘性类属性，必须显式清零）。
+
+    ``Db.set_config`` 只在 prefix 非空时覆盖 ``Db._prefix``——discover
+    全量运行时，本模块设置的 ``prefix`` 会泄漏给后续所有模块。任何
+    改动全局前缀的用例都必须经此恢复（tearDownModule 兜底）。
+    """
+    Db.close()
+    Db._prefix = ""
+    Db.set_config({"database": ":memory:"})
+
+
+def tearDownModule():
+    _reset_global_db()
+
+
 def _on(**extra):
     Db.close()
     Db.set_config({"database": ":memory:", "json": True, **extra})
@@ -58,6 +74,7 @@ class TestAutoCreate(_Base):
     def test_name_respects_prefix(self):
         Db.set_config({"database": ":memory:", "json": True,
                        "prefix": "app_"})
+        self.addCleanup(_reset_global_db)
         Db.name("logs").insert({"msg": "hi"})
         tables = {r["name"] for r in Db.get_connection().query(
             "SELECT name FROM sqlite_master WHERE type='table'")}
